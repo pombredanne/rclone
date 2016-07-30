@@ -26,21 +26,39 @@ d) Delete remote
 q) Quit config
 e/n/d/q> n
 name> remote
-What type of source is it?
-Choose a number from below
- 1) swift
- 2) s3
- 3) local
- 4) google cloud storage
- 5) dropbox
- 6) drive
-type> 4
+Type of storage to configure.
+Choose a number from below, or type in your own value
+ 1 / Amazon Drive
+   \ "amazon cloud drive"
+ 2 / Amazon S3 (also Dreamhost, Ceph)
+   \ "s3"
+ 3 / Backblaze B2
+   \ "b2"
+ 4 / Dropbox
+   \ "dropbox"
+ 5 / Google Cloud Storage (this is not Google Drive)
+   \ "google cloud storage"
+ 6 / Google Drive
+   \ "drive"
+ 7 / Hubic
+   \ "hubic"
+ 8 / Local Disk
+   \ "local"
+ 9 / Microsoft OneDrive
+   \ "onedrive"
+10 / Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)
+   \ "swift"
+11 / Yandex Disk
+   \ "yandex"
+Storage> 5
 Google Application Client Id - leave blank normally.
 client_id> 
 Google Application Client Secret - leave blank normally.
 client_secret> 
 Project number optional - needed only for list/create/delete buckets - see your developer console.
 project_number> 12345678
+Service Account Credentials JSON file path - needed only if you want use SA instead of interactive login.
+service_account_file> 
 Access Control List for new objects.
 Choose a number from below, or type in your own value
  * Object owner gets OWNER access, and all Authenticated Users get READER access.
@@ -122,6 +140,30 @@ Sync `/home/local/directory` to the remote bucket, deleting any excess
 files in the bucket.
 
     rclone sync /home/local/directory remote:bucket
+
+### Service Account support ###
+
+You can set up rclone with Google Cloud Storage in an unattended mode,
+i.e. not tied to a specific end-user Google account. This is useful
+when you want to synchronise files onto machines that don't have
+actively logged-in users, for example build machines.
+
+To get credentials for Google Cloud Platform
+[IAM Service Accounts](https://cloud.google.com/iam/docs/service-accounts),
+please head to the
+[Service Account](https://console.cloud.google.com/permissions/serviceaccounts)
+section of the Google Developer Console. Service Accounts behave just
+like normal `User` permissions in
+[Google Cloud Storage ACLs](https://cloud.google.com/storage/docs/access-control),
+so you can limit their access (e.g. make them read only). After
+creating an account, a JSON file containing the Service Account's
+credentials will be downloaded onto your machines. These credentials
+are what rclone will use for authentication.
+
+To use a Service Account instead of OAuth2 token flow, enter the path
+to your Service Account credentials at the `service_account_file`
+prompt and rclone won't use the browser based authentication
+flow.
 
 ### Modified time ###
 

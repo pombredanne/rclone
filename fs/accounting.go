@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -120,18 +119,18 @@ func (s *StatsInfo) String() string {
 	dtSeconds := dt.Seconds()
 	speed := 0.0
 	if dt > 0 {
-		speed = float64(s.bytes) / 1024 / dtSeconds
+		speed = float64(s.bytes) / dtSeconds
 	}
 	dtRounded := dt - (dt % (time.Second / 10))
 	buf := &bytes.Buffer{}
 	fmt.Fprintf(buf, `
-Transferred:   %10d Bytes (%7.2f kByte/s)
+Transferred:   %10s (%s)
 Errors:        %10d
 Checks:        %10d
 Transferred:   %10d
 Elapsed time:  %10v
 `,
-		s.bytes, speed,
+		SizeSuffix(s.bytes).Unit("Bytes"), SizeSuffix(speed).Unit("Bytes/s"),
 		s.errors,
 		s.checks,
 		s.transfers,
@@ -147,7 +146,7 @@ Elapsed time:  %10v
 
 // Log outputs the StatsInfo to the log
 func (s *StatsInfo) Log() {
-	log.Printf("%v\n", s)
+	Log(nil, "%v\n", s)
 }
 
 // Bytes updates the stats for bytes bytes
@@ -203,17 +202,17 @@ func (s *StatsInfo) Error() {
 }
 
 // Checking adds a check into the stats
-func (s *StatsInfo) Checking(o Object) {
+func (s *StatsInfo) Checking(remote string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	s.checking[o.Remote()] = struct{}{}
+	s.checking[remote] = struct{}{}
 }
 
 // DoneChecking removes a check from the stats
-func (s *StatsInfo) DoneChecking(o Object) {
+func (s *StatsInfo) DoneChecking(remote string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	delete(s.checking, o.Remote())
+	delete(s.checking, remote)
 	s.checks++
 }
 
@@ -225,17 +224,17 @@ func (s *StatsInfo) GetTransfers() int64 {
 }
 
 // Transferring adds a transfer into the stats
-func (s *StatsInfo) Transferring(o Object) {
+func (s *StatsInfo) Transferring(remote string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	s.transferring[o.Remote()] = struct{}{}
+	s.transferring[remote] = struct{}{}
 }
 
 // DoneTransferring removes a transfer from the stats
-func (s *StatsInfo) DoneTransferring(o Object) {
+func (s *StatsInfo) DoneTransferring(remote string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	delete(s.transferring, o.Remote())
+	delete(s.transferring, remote)
 	s.transfers++
 }
 

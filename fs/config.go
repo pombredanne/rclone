@@ -4,8 +4,14 @@ package fs
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
@@ -16,12 +22,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"crypto/tls"
+	"unicode/utf8"
 
 	"github.com/Unknwon/goconfig"
 	"github.com/mreiferson/go-httpclient"
+	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
+	"golang.org/x/crypto/nacl/secretbox"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -54,38 +62,57 @@ var (
 	// Config is the global config
 	Config = &ConfigInfo{}
 	// Flags
-	verbose        = pflag.BoolP("verbose", "v", false, "Print lots more stuff")
-	quiet          = pflag.BoolP("quiet", "q", false, "Print as little stuff as possible")
-	modifyWindow   = pflag.DurationP("modify-window", "", time.Nanosecond, "Max time diff to be considered the same")
-	checkers       = pflag.IntP("checkers", "", 8, "Number of checkers to run in parallel.")
-	transfers      = pflag.IntP("transfers", "", 4, "Number of file transfers to run in parallel.")
-	configFile     = pflag.StringP("config", "", ConfigPath, "Config file.")
-	checkSum       = pflag.BoolP("checksum", "c", false, "Skip based on checksum & size, not mod-time & size")
-	sizeOnly       = pflag.BoolP("size-only", "", false, "Skip based on size only, not mod-time or checksum")
-	ignoreExisting = pflag.BoolP("ignore-existing", "", false, "Skip all files that exist on destination")
-	dryRun         = pflag.BoolP("dry-run", "n", false, "Do a trial run with no permanent changes")
-	connectTimeout = pflag.DurationP("contimeout", "", 60*time.Second, "Connect timeout")
-	timeout        = pflag.DurationP("timeout", "", 5*60*time.Second, "IO idle timeout")
-	dumpHeaders    = pflag.BoolP("dump-headers", "", false, "Dump HTTP headers - may contain sensitive info")
-	dumpBodies     = pflag.BoolP("dump-bodies", "", false, "Dump HTTP headers and bodies - may contain sensitive info")
-	skipVerify     = pflag.BoolP("no-check-certificate", "", false, "Do not verify the server SSL certificate. Insecure.")
-	deleteBefore   = pflag.BoolP("delete-before", "", false, "When synchronizing, delete files on destination before transfering")
-	deleteDuring   = pflag.BoolP("delete-during", "", false, "When synchronizing, delete files during transfer (default)")
-	deleteAfter    = pflag.BoolP("delete-after", "", false, "When synchronizing, delete files on destination after transfering")
-	bwLimit        SizeSuffix
+	verbose         = pflag.BoolP("verbose", "v", false, "Print lots more stuff")
+	quiet           = pflag.BoolP("quiet", "q", false, "Print as little stuff as possible")
+	modifyWindow    = pflag.DurationP("modify-window", "", time.Nanosecond, "Max time diff to be considered the same")
+	checkers        = pflag.IntP("checkers", "", 8, "Number of checkers to run in parallel.")
+	transfers       = pflag.IntP("transfers", "", 4, "Number of file transfers to run in parallel.")
+	configFile      = pflag.StringP("config", "", ConfigPath, "Config file.")
+	checkSum        = pflag.BoolP("checksum", "c", false, "Skip based on checksum & size, not mod-time & size")
+	sizeOnly        = pflag.BoolP("size-only", "", false, "Skip based on size only, not mod-time or checksum")
+	ignoreTimes     = pflag.BoolP("ignore-times", "I", false, "Don't skip files that match size and time - transfer all files")
+	ignoreExisting  = pflag.BoolP("ignore-existing", "", false, "Skip all files that exist on destination")
+	dryRun          = pflag.BoolP("dry-run", "n", false, "Do a trial run with no permanent changes")
+	connectTimeout  = pflag.DurationP("contimeout", "", 60*time.Second, "Connect timeout")
+	timeout         = pflag.DurationP("timeout", "", 5*60*time.Second, "IO idle timeout")
+	dumpHeaders     = pflag.BoolP("dump-headers", "", false, "Dump HTTP headers - may contain sensitive info")
+	dumpBodies      = pflag.BoolP("dump-bodies", "", false, "Dump HTTP headers and bodies - may contain sensitive info")
+	skipVerify      = pflag.BoolP("no-check-certificate", "", false, "Do not verify the server SSL certificate. Insecure.")
+	AskPassword     = pflag.BoolP("ask-password", "", true, "Allow prompt for password for encrypted configuration.")
+	deleteBefore    = pflag.BoolP("delete-before", "", false, "When synchronizing, delete files on destination before transfering")
+	deleteDuring    = pflag.BoolP("delete-during", "", false, "When synchronizing, delete files during transfer (default)")
+	deleteAfter     = pflag.BoolP("delete-after", "", false, "When synchronizing, delete files on destination after transfering")
+	lowLevelRetries = pflag.IntP("low-level-retries", "", 10, "Number of low level retries to do.")
+	updateOlder     = pflag.BoolP("update", "u", false, "Skip files that are newer on the destination.")
+	noGzip          = pflag.BoolP("no-gzip-encoding", "", false, "Don't set Accept-Encoding: gzip.")
+	dedupeMode      = pflag.StringP("dedupe-mode", "", "interactive", "Dedupe mode interactive|skip|first|newest|oldest|rename.")
+	maxDepth        = pflag.IntP("max-depth", "", -1, "If set limits the recursion depth to this.")
+	ignoreSize      = pflag.BoolP("ignore-size", "", false, "Ignore size when skipping use mod-time or checksum.")
+	noTraverse      = pflag.BoolP("no-traverse", "", false, "Don't traverse destination file system on copy.")
+	noUpdateModTime = pflag.BoolP("no-update-modtime", "", false, "Don't update destination mod-time if files identical.")
+	bwLimit         SizeSuffix
+
+	// Key to use for password en/decryption.
+	// When nil, no encryption will be used for saving.
+	configKey []byte
 )
 
 func init() {
-	pflag.VarP(&bwLimit, "bwlimit", "", "Bandwidth limit in kBytes/s, or use suffix k|M|G")
+	pflag.VarP(&bwLimit, "bwlimit", "", "Bandwidth limit in kBytes/s, or use suffix b|k|M|G")
 }
 
-// Turn SizeSuffix into a string
-func (x SizeSuffix) String() string {
+// Turn SizeSuffix into a string and a suffix
+func (x SizeSuffix) string() (string, string) {
 	scaled := float64(0)
 	suffix := ""
 	switch {
+	case x < 0:
+		return "off", ""
 	case x == 0:
-		return "0"
+		return "0", ""
+	case x < 1024:
+		scaled = float64(x)
+		suffix = ""
 	case x < 1024*1024:
 		scaled = float64(x) / 1024
 		suffix = "k"
@@ -97,15 +124,34 @@ func (x SizeSuffix) String() string {
 		suffix = "G"
 	}
 	if math.Floor(scaled) == scaled {
-		return fmt.Sprintf("%.0f%s", scaled, suffix)
+		return fmt.Sprintf("%.0f", scaled), suffix
 	}
-	return fmt.Sprintf("%.3f%s", scaled, suffix)
+	return fmt.Sprintf("%.3f", scaled), suffix
+}
+
+// String turns SizeSuffix into a string
+func (x SizeSuffix) String() string {
+	val, suffix := x.string()
+	return val + suffix
+}
+
+// Unit turns SizeSuffix into a string with a unit
+func (x SizeSuffix) Unit(unit string) string {
+	val, suffix := x.string()
+	if val == "off" {
+		return val
+	}
+	return val + " " + suffix + unit
 }
 
 // Set a SizeSuffix
 func (x *SizeSuffix) Set(s string) error {
 	if len(s) == 0 {
-		return fmt.Errorf("Empty string")
+		return errors.New("empty string")
+	}
+	if strings.ToLower(s) == "off" {
+		*x = -1
+		return nil
 	}
 	suffix := s[len(s)-1]
 	suffixLen := 1
@@ -114,6 +160,8 @@ func (x *SizeSuffix) Set(s string) error {
 	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.':
 		suffixLen = 0
 		multiplier = 1 << 10
+	case 'b', 'B':
+		multiplier = 1
 	case 'k', 'K':
 		multiplier = 1 << 10
 	case 'm', 'M':
@@ -121,7 +169,7 @@ func (x *SizeSuffix) Set(s string) error {
 	case 'g', 'G':
 		multiplier = 1 << 30
 	default:
-		return fmt.Errorf("Bad suffix %q", suffix)
+		return errors.Errorf("bad suffix %q", suffix)
 	}
 	s = s[:len(s)-suffixLen]
 	value, err := strconv.ParseFloat(s, 64)
@@ -129,7 +177,7 @@ func (x *SizeSuffix) Set(s string) error {
 		return err
 	}
 	if value < 0 {
-		return fmt.Errorf("Size can't be negative %q", s)
+		return errors.Errorf("size can't be negative %q", s)
 	}
 	value *= multiplier
 	*x = SizeSuffix(value)
@@ -172,6 +220,7 @@ type ConfigInfo struct {
 	DryRun             bool
 	CheckSum           bool
 	SizeOnly           bool
+	IgnoreTimes        bool
 	IgnoreExisting     bool
 	ModifyWindow       time.Duration
 	Checkers           int
@@ -185,6 +234,14 @@ type ConfigInfo struct {
 	DeleteBefore       bool // Delete before checking
 	DeleteDuring       bool // Delete during checking/transfer
 	DeleteAfter        bool // Delete after successful transfer.
+	LowLevelRetries    int
+	UpdateOlder        bool // Skip files that are newer on the destination
+	NoGzip             bool // Disable compression
+	DedupeMode         DeduplicateMode
+	MaxDepth           int
+	IgnoreSize         bool
+	NoTraverse         bool
+	NoUpdateModTime    bool
 }
 
 // Transport returns an http.RoundTripper with the correct timeouts
@@ -219,6 +276,16 @@ func (ci *ConfigInfo) Transport() http.RoundTripper {
 		// In this mode, TLS is susceptible to man-in-the-middle attacks.
 		// This should be used only for testing.
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: ci.InsecureSkipVerify},
+
+		// DisableCompression, if true, prevents the Transport from
+		// requesting compression with an "Accept-Encoding: gzip"
+		// request header when the Request contains no existing
+		// Accept-Encoding value. If the Transport requests gzip on
+		// its own and gets a gzipped response, it's transparently
+		// decoded in the Response.Body. However, if the user
+		// explicitly requested gzip it is not automatically
+		// uncompressed.
+		DisableCompression: *noGzip,
 	}
 	if ci.DumpHeaders || ci.DumpBodies {
 		return NewLoggedTransport(t, ci.DumpBodies)
@@ -247,10 +314,10 @@ func configHome() string {
 	if home != "" {
 		return home
 	}
-	log.Printf("Couldn't find home directory or read HOME environment variable.")
-	log.Printf("Defaulting to storing config in current directory.")
-	log.Printf("Use -config flag to workaround.")
-	log.Printf("Error was: %v", err)
+	ErrorLog(nil, "Couldn't find home directory or read HOME environment variable.")
+	ErrorLog(nil, "Defaulting to storing config in current directory.")
+	ErrorLog(nil, "Use -config flag to workaround.")
+	ErrorLog(nil, "Error was: %v", err)
 	return ""
 }
 
@@ -269,16 +336,41 @@ func LoadConfig() {
 	Config.ConnectTimeout = *connectTimeout
 	Config.CheckSum = *checkSum
 	Config.SizeOnly = *sizeOnly
+	Config.IgnoreTimes = *ignoreTimes
 	Config.IgnoreExisting = *ignoreExisting
 	Config.DumpHeaders = *dumpHeaders
 	Config.DumpBodies = *dumpBodies
 	Config.InsecureSkipVerify = *skipVerify
+	Config.LowLevelRetries = *lowLevelRetries
+	Config.UpdateOlder = *updateOlder
+	Config.NoGzip = *noGzip
+	Config.MaxDepth = *maxDepth
+	Config.IgnoreSize = *ignoreSize
+	Config.NoTraverse = *noTraverse
+	Config.NoUpdateModTime = *noUpdateModTime
 
 	ConfigPath = *configFile
 
 	Config.DeleteBefore = *deleteBefore
 	Config.DeleteDuring = *deleteDuring
 	Config.DeleteAfter = *deleteAfter
+
+	switch strings.ToLower(*dedupeMode) {
+	case "interactive":
+		Config.DedupeMode = DeduplicateInteractive
+	case "skip":
+		Config.DedupeMode = DeduplicateSkip
+	case "first":
+		Config.DedupeMode = DeduplicateFirst
+	case "newest":
+		Config.DedupeMode = DeduplicateNewest
+	case "oldest":
+		Config.DedupeMode = DeduplicateOldest
+	case "rename":
+		Config.DedupeMode = DeduplicateRename
+	default:
+		log.Fatalf(`Unknown mode for --dedupe-mode %q.`, *dedupeMode)
+	}
 
 	switch {
 	case *deleteBefore && (*deleteDuring || *deleteAfter),
@@ -290,15 +382,15 @@ func LoadConfig() {
 		Config.DeleteDuring = true
 	}
 
+	if Config.IgnoreSize && Config.SizeOnly {
+		log.Fatalf(`Can't use --size-only and --ignore-size together.`)
+	}
+
 	// Load configuration file.
 	var err error
-	ConfigFile, err = goconfig.LoadConfigFile(ConfigPath)
+	ConfigFile, err = loadConfigFile()
 	if err != nil {
-		log.Printf("Failed to load config file %v - using defaults: %v", ConfigPath, err)
-		ConfigFile, err = goconfig.LoadConfigFile(os.DevNull)
-		if err != nil {
-			log.Fatalf("Failed to read null config file: %v", err)
-		}
+		log.Fatalf("Failed to config file \"%s\": %v", ConfigPath, err)
 	}
 
 	// Load filters
@@ -311,15 +403,189 @@ func LoadConfig() {
 	startTokenBucket()
 }
 
+// loadConfigFile will load a config file, and
+// automatically decrypt it.
+func loadConfigFile() (*goconfig.ConfigFile, error) {
+	b, err := ioutil.ReadFile(ConfigPath)
+	if err != nil {
+		Log(nil, "Failed to load config file \"%v\" - using defaults: %v", ConfigPath, err)
+		return goconfig.LoadFromReader(&bytes.Buffer{})
+	}
+
+	// Find first non-empty line
+	r := bufio.NewReader(bytes.NewBuffer(b))
+	for {
+		line, _, err := r.ReadLine()
+		if err != nil {
+			if err == io.EOF {
+				return goconfig.LoadFromReader(bytes.NewBuffer(b))
+			}
+			return nil, err
+		}
+		l := strings.TrimSpace(string(line))
+		if len(l) == 0 || strings.HasPrefix(l, ";") || strings.HasPrefix(l, "#") {
+			continue
+		}
+		// First non-empty or non-comment must be ENCRYPT_V0
+		if l == "RCLONE_ENCRYPT_V0:" {
+			break
+		}
+		if strings.HasPrefix(l, "RCLONE_ENCRYPT_V") {
+			return nil, errors.New("unsupported configuration encryption - update rclone for support")
+		}
+		return goconfig.LoadFromReader(bytes.NewBuffer(b))
+	}
+
+	// Encrypted content is base64 encoded.
+	dec := base64.NewDecoder(base64.StdEncoding, r)
+	box, err := ioutil.ReadAll(dec)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to load base64 encoded data")
+	}
+	if len(box) < 24+secretbox.Overhead {
+		return nil, errors.New("Configuration data too short")
+	}
+	envpw := os.Getenv("RCLONE_CONFIG_PASS")
+
+	var out []byte
+	for {
+		if len(configKey) == 0 && envpw != "" {
+			err := setPassword(envpw)
+			if err != nil {
+				fmt.Println("Using RCLONE_CONFIG_PASS returned:", err)
+				envpw = ""
+			} else {
+				Debug(nil, "Using RCLONE_CONFIG_PASS password.")
+			}
+		}
+		if len(configKey) == 0 {
+			if !*AskPassword {
+				return nil, errors.New("unable to decrypt configuration and not allowed to ask for password - set RCLONE_CONFIG_PASS to your configuration password")
+			}
+			getPassword("Enter configuration password:")
+		}
+
+		// Nonce is first 24 bytes of the ciphertext
+		var nonce [24]byte
+		copy(nonce[:], box[:24])
+		var key [32]byte
+		copy(key[:], configKey[:32])
+
+		// Attempt to decrypt
+		var ok bool
+		out, ok = secretbox.Open(nil, box[24:], &nonce, &key)
+		if ok {
+			break
+		}
+
+		// Retry
+		ErrorLog(nil, "Couldn't decrypt configuration, most likely wrong password.")
+		configKey = nil
+		envpw = ""
+	}
+	return goconfig.LoadFromReader(bytes.NewBuffer(out))
+}
+
+// getPassword will query the user for a password the
+// first time it is required.
+func getPassword(q string) {
+	if len(configKey) != 0 {
+		return
+	}
+	for {
+		fmt.Println(q)
+		fmt.Print("password:")
+		err := setPassword(ReadPassword())
+		if err == nil {
+			return
+		}
+		fmt.Println("Error:", err)
+	}
+}
+
+// setPassword will set the configKey to the hash of
+// the password. If the length of the password is
+// zero after trimming+normalization, an error is returned.
+func setPassword(password string) error {
+	if !utf8.ValidString(password) {
+		return errors.New("password contains invalid utf8 characters")
+	}
+	// Remove leading+trailing whitespace
+	password = strings.TrimSpace(password)
+
+	// Normalize to reduce weird variations.
+	password = norm.NFKC.String(password)
+	if len(password) == 0 {
+		return errors.New("no characters in password")
+	}
+	// Create SHA256 has of the password
+	sha := sha256.New()
+	_, err := sha.Write([]byte("[" + password + "][rclone-config]"))
+	if err != nil {
+		return err
+	}
+	configKey = sha.Sum(nil)
+	return nil
+}
+
 // SaveConfig saves configuration file.
+// if configKey has been set, the file will be encrypted.
 func SaveConfig() {
-	err := goconfig.SaveConfigFile(ConfigFile, ConfigPath)
+	if len(configKey) == 0 {
+		err := goconfig.SaveConfigFile(ConfigFile, ConfigPath)
+		if err != nil {
+			log.Fatalf("Failed to save config file: %v", err)
+		}
+		err = os.Chmod(ConfigPath, 0600)
+		if err != nil {
+			ErrorLog(nil, "Failed to set permissions on config file: %v", err)
+		}
+		return
+	}
+	var buf bytes.Buffer
+	err := goconfig.SaveConfigData(ConfigFile, &buf)
 	if err != nil {
 		log.Fatalf("Failed to save config file: %v", err)
 	}
+
+	f, err := os.Create(ConfigPath)
+	if err != nil {
+		log.Fatalf("Failed to save config file: %v", err)
+	}
+
+	fmt.Fprintln(f, "# Encrypted rclone configuration File")
+	fmt.Fprintln(f, "")
+	fmt.Fprintln(f, "RCLONE_ENCRYPT_V0:")
+
+	// Generate new nonce and write it to the start of the ciphertext
+	var nonce [24]byte
+	n, _ := rand.Read(nonce[:])
+	if n != 24 {
+		log.Fatalf("nonce short read: %d", n)
+	}
+	enc := base64.NewEncoder(base64.StdEncoding, f)
+	_, err = enc.Write(nonce[:])
+	if err != nil {
+		log.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var key [32]byte
+	copy(key[:], configKey[:32])
+
+	b := secretbox.Seal(nil, buf.Bytes(), &nonce, &key)
+	_, err = enc.Write(b)
+	if err != nil {
+		log.Fatalf("Failed to write config file: %v", err)
+	}
+	_ = enc.Close()
+	err = f.Close()
+	if err != nil {
+		log.Fatalf("Failed to close config file: %v", err)
+	}
+
 	err = os.Chmod(ConfigPath, 0600)
 	if err != nil {
-		log.Printf("Failed to set permissions on config file: %v", err)
+		ErrorLog(nil, "Failed to set permissions on config file: %v", err)
 	}
 }
 
@@ -389,13 +655,34 @@ func Choose(what string, defaults, help []string, newOk bool) string {
 	}
 	fmt.Println()
 	for i, text := range defaults {
+		var lines []string
 		if help != nil {
 			parts := strings.Split(help[i], "\n")
-			for _, part := range parts {
-				fmt.Printf(" * %s\n", part)
+			lines = append(lines, parts...)
+		}
+		lines = append(lines, fmt.Sprintf("%q", text))
+		pos := i + 1
+		if len(lines) == 1 {
+			fmt.Printf("%2d > %s\n", pos, text)
+		} else {
+			mid := (len(lines) - 1) / 2
+			for i, line := range lines {
+				var sep rune
+				switch i {
+				case 0:
+					sep = '/'
+				case len(lines) - 1:
+					sep = '\\'
+				default:
+					sep = '|'
+				}
+				number := "  "
+				if i == mid {
+					number = fmt.Sprintf("%2d", pos)
+				}
+				fmt.Printf("%s %c %s\n", number, sep, line)
 			}
 		}
-		fmt.Printf("%2d) %s\n", i+1, text)
 	}
 	for {
 		fmt.Printf("%s> ", what)
@@ -454,7 +741,7 @@ func OkRemote(name string) bool {
 		ConfigFile.DeleteSection(name)
 		return true
 	default:
-		log.Printf("Bad choice %d", i)
+		ErrorLog(nil, "Bad choice %d", i)
 	}
 	return false
 }
@@ -491,14 +778,26 @@ func ChooseOption(o *Option) string {
 	return ReadLine()
 }
 
+// fsOption returns an Option describing the possible remotes
+func fsOption() *Option {
+	o := &Option{
+		Name: "Storage",
+		Help: "Type of storage to configure.",
+	}
+	for _, item := range fsRegistry {
+		example := OptionExample{
+			Value: item.Name,
+			Help:  item.Description,
+		}
+		o.Examples = append(o.Examples, example)
+	}
+	o.Examples.Sort()
+	return o
+}
+
 // NewRemote make a new remote from its name
 func NewRemote(name string) {
-	fmt.Printf("What type of source is it?\n")
-	types := []string{}
-	for _, item := range fsRegistry {
-		types = append(types, item.Name)
-	}
-	newType := Choose("type", types, nil, false)
+	newType := ChooseOption(fsOption())
 	ConfigFile.SetValue(name, "type", newType)
 	fs, err := Find(newType)
 	if err != nil {
@@ -547,14 +846,14 @@ func DeleteRemote(name string) {
 func EditConfig() {
 	for {
 		haveRemotes := len(ConfigFile.GetSectionList()) != 0
-		what := []string{"eEdit existing remote", "nNew remote", "dDelete remote", "qQuit config"}
+		what := []string{"eEdit existing remote", "nNew remote", "dDelete remote", "sSet configuration password", "qQuit config"}
 		if haveRemotes {
 			fmt.Printf("Current remotes:\n\n")
 			ShowRemotes()
 			fmt.Printf("\n")
 		} else {
 			fmt.Printf("No remotes found - make a new one\n")
-			what = append(what[1:2], what[3])
+			what = append(what[1:2], what[3:]...)
 		}
 		switch i := Command(what); i {
 		case 'e':
@@ -581,9 +880,69 @@ func EditConfig() {
 		case 'd':
 			name := ChooseRemote()
 			DeleteRemote(name)
+		case 's':
+			SetPassword()
 		case 'q':
 			return
+
 		}
+	}
+}
+
+// SetPassword will allow the user to modify the current
+// configuration encryption settings.
+func SetPassword() {
+	for {
+		if len(configKey) > 0 {
+			fmt.Println("Your configuration is encrypted.")
+			what := []string{"cChange Password", "uUnencrypt configuration", "qQuit to main menu"}
+			switch i := Command(what); i {
+			case 'c':
+				changePassword()
+				SaveConfig()
+				fmt.Println("Password changed")
+				continue
+			case 'u':
+				configKey = nil
+				SaveConfig()
+				continue
+			case 'q':
+				return
+			}
+
+		} else {
+			fmt.Println("Your configuration is not encrypted.")
+			fmt.Println("If you add a password, you will protect your login information to cloud services.")
+			what := []string{"aAdd Password", "qQuit to main menu"}
+			switch i := Command(what); i {
+			case 'a':
+				changePassword()
+				SaveConfig()
+				fmt.Println("Password set")
+				continue
+			case 'q':
+				return
+			}
+		}
+	}
+}
+
+// changePassword will query the user twice
+// for a password. If the same password is entered
+// twice the key is updated.
+func changePassword() {
+	for {
+		configKey = nil
+		getPassword("Enter NEW configuration password:")
+		a := configKey
+		// re-enter password
+		configKey = nil
+		getPassword("Confirm NEW password:")
+		b := configKey
+		if bytes.Equal(a, b) {
+			return
+		}
+		fmt.Println("Passwords does not match!")
 	}
 }
 

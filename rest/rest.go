@@ -1,19 +1,23 @@
 // Package rest implements a simple REST wrapper
+//
+// All methods are safe for concurrent calling.
 package rest
 
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"sync"
 
 	"github.com/ncw/rclone/fs"
+	"github.com/pkg/errors"
 )
 
 // Client contains the info to sustain the API
 type Client struct {
+	mu           sync.RWMutex
 	c            *http.Client
 	rootURL      string
 	errorHandler func(resp *http.Response) error
@@ -39,24 +43,30 @@ func defaultErrorHandler(resp *http.Response) (err error) {
 	if err != nil {
 		return err
 	}
-	return fmt.Errorf("HTTP error %v (%v) returned body: %q", resp.StatusCode, resp.Status, body)
+	return errors.Errorf("HTTP error %v (%v) returned body: %q", resp.StatusCode, resp.Status, body)
 }
 
 // SetErrorHandler sets the handler to decode an error response when
 // the HTTP status code is not 2xx.  The handler should close resp.Body.
 func (api *Client) SetErrorHandler(fn func(resp *http.Response) error) *Client {
+	api.mu.Lock()
+	defer api.mu.Unlock()
 	api.errorHandler = fn
 	return api
 }
 
 // SetRoot sets the default root URL
 func (api *Client) SetRoot(RootURL string) *Client {
+	api.mu.Lock()
+	defer api.mu.Unlock()
 	api.rootURL = RootURL
 	return api
 }
 
 // SetHeader sets a header for all requests
 func (api *Client) SetHeader(key, value string) *Client {
+	api.mu.Lock()
+	defer api.mu.Unlock()
 	api.headers[key] = value
 	return api
 }
@@ -89,15 +99,17 @@ func DecodeJSON(resp *http.Response, result interface{}) (err error) {
 //
 // it will return resp if at all possible, even if err is set
 func (api *Client) Call(opts *Opts) (resp *http.Response, err error) {
+	api.mu.RLock()
+	defer api.mu.RUnlock()
 	if opts == nil {
-		return nil, fmt.Errorf("call() called with nil opts")
+		return nil, errors.New("call() called with nil opts")
 	}
 	var url string
 	if opts.Absolute {
 		url = opts.Path
 	} else {
 		if api.rootURL == "" {
-			return nil, fmt.Errorf("RootURL not set")
+			return nil, errors.New("RootURL not set")
 		}
 		url = api.rootURL + opts.Path
 	}
@@ -127,12 +139,16 @@ func (api *Client) Call(opts *Opts) (resp *http.Response, err error) {
 	}
 	// Now set the headers
 	for k, v := range headers {
-		req.Header.Add(k, v)
+		if v != "" {
+			req.Header.Add(k, v)
+		}
 	}
 	if opts.UserName != "" || opts.Password != "" {
 		req.SetBasicAuth(opts.UserName, opts.Password)
 	}
+	api.mu.RUnlock()
 	resp, err = api.c.Do(req)
+	api.mu.RLock()
 	if err != nil {
 		return nil, err
 	}

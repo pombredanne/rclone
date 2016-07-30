@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -34,21 +35,24 @@ var (
 	}
 	binary = "fs.test"
 	// Flags
-	maxTries = flag.Int("maxtries", 3, "Number of times to try each test")
-	runTests = flag.String("run", "", "Comma separated list of remotes to test, eg 'TestSwift:,TestS3'")
+	maxTries = flag.Int("maxtries", 5, "Number of times to try each test")
+	runTests = flag.String("remotes", "", "Comma separated list of remotes to test, eg 'TestSwift:,TestS3'")
 	verbose  = flag.Bool("verbose", false, "Run the tests with -v")
 	clean    = flag.Bool("clean", false, "Instead of testing, clean all left over test directories")
+	runOnly  = flag.String("run-only", "", "Run only those tests matching the regexp supplied")
 )
 
 // test holds info about a running test
 type test struct {
-	remote    string
-	subdir    bool
-	cmdLine   []string
-	cmdString string
-	try       int
-	err       error
-	output    []byte
+	remote      string
+	subdir      bool
+	cmdLine     []string
+	cmdString   string
+	try         int
+	err         error
+	output      []byte
+	failedTests []string
+	runFlag     string
 }
 
 // newTest creates a new test
@@ -62,6 +66,9 @@ func newTest(remote string, subdir bool) *test {
 	if *verbose {
 		t.cmdLine = append(t.cmdLine, "-test.v")
 	}
+	if *runOnly != "" {
+		t.cmdLine = append(t.cmdLine, "-test.run", *runOnly)
+	}
 	if subdir {
 		t.cmdLine = append(t.cmdLine, "-subdir")
 	}
@@ -69,17 +76,55 @@ func newTest(remote string, subdir bool) *test {
 	return t
 }
 
+// dumpOutput prints the error output
+func (t *test) dumpOutput() {
+	log.Println("------------------------------------------------------------")
+	log.Printf("---- %q ----", t.cmdString)
+	log.Println(string(t.output))
+	log.Println("------------------------------------------------------------")
+}
+
+var failRe = regexp.MustCompile(`(?m)^--- FAIL: (Test\w*) \(`)
+
+// findFailures looks for all the tests which failed
+func (t *test) findFailures() {
+	oldFailedTests := t.failedTests
+	t.failedTests = nil
+	for _, matches := range failRe.FindAllSubmatch(t.output, -1) {
+		t.failedTests = append(t.failedTests, string(matches[1]))
+	}
+	if len(t.failedTests) != 0 {
+		t.runFlag = "^(" + strings.Join(t.failedTests, "|") + ")$"
+	} else {
+		t.runFlag = ""
+	}
+	if t.passed() && len(t.failedTests) != 0 {
+		log.Printf("%q - Expecting no errors but got: %v", t.cmdString, t.failedTests)
+		t.dumpOutput()
+	} else if !t.passed() && len(t.failedTests) == 0 {
+		log.Printf("%q - Expecting errors but got none: %v", t.cmdString, t.failedTests)
+		t.dumpOutput()
+		t.failedTests = oldFailedTests
+	}
+}
+
 // trial runs a single test
 func (t *test) trial() {
-	log.Printf("%q - Starting (try %d/%d)", t.cmdString, t.try, *maxTries)
-	cmd := exec.Command(t.cmdLine[0], t.cmdLine[1:]...)
+	cmdLine := t.cmdLine[:]
+	if t.runFlag != "" {
+		cmdLine = append(cmdLine, "-test.run", t.runFlag)
+	}
+	cmdString := strings.Join(cmdLine, " ")
+	log.Printf("%q - Starting (try %d/%d)", cmdString, t.try, *maxTries)
+	cmd := exec.Command(cmdLine[0], cmdLine[1:]...)
 	start := time.Now()
 	t.output, t.err = cmd.CombinedOutput()
 	duration := time.Since(start)
+	t.findFailures()
 	if t.passed() {
-		log.Printf("%q - Finished OK in %v (try %d/%d)", t.cmdString, duration, t.try, *maxTries)
+		log.Printf("%q - Finished OK in %v (try %d/%d)", cmdString, duration, t.try, *maxTries)
 	} else {
-		log.Printf("%q - Finished ERROR in %v (try %d/%d): %v", t.cmdString, duration, t.try, *maxTries, t.err)
+		log.Printf("%q - Finished ERROR in %v (try %d/%d): %v: Failed %v", cmdString, duration, t.try, *maxTries, t.err, t.failedTests)
 	}
 }
 
@@ -89,7 +134,8 @@ func (t *test) cleanFs() error {
 	if err != nil {
 		return err
 	}
-	for dir := range f.ListDir() {
+	dirs, err := fs.NewLister().SetLevel(1).Start(f, "").GetDirs()
+	for _, dir := range dirs {
 		if fstest.MatchTestRemote.MatchString(dir.Name) {
 			log.Printf("Purging %s%s", t.remote, dir.Name)
 			dir, err := fs.NewFs(t.remote + dir.Name)
@@ -141,9 +187,7 @@ func (t *test) run(result chan<- *test) {
 		}
 	}
 	if !t.passed() {
-		log.Println("------------------------------------------------------------")
-		log.Println(string(t.output))
-		log.Println("------------------------------------------------------------")
+		t.dumpOutput()
 	}
 	result <- t
 }

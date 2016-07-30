@@ -3,7 +3,6 @@ package swift
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/swift"
+	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -29,9 +29,10 @@ var (
 
 // Register with Fs
 func init() {
-	fs.Register(&fs.Info{
-		Name:  "swift",
-		NewFs: NewFs,
+	fs.Register(&fs.RegInfo{
+		Name:        "swift",
+		Description: "Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)",
+		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name: "user",
 			Help: "User name to log in.",
@@ -61,11 +62,23 @@ func init() {
 				Value: "https://auth.cloud.ovh.net/v2.0",
 			}},
 		}, {
+			Name: "domain",
+			Help: "User domain - optional (v3 auth)",
+		}, {
 			Name: "tenant",
-			Help: "Tenant name - optional",
+			Help: "Tenant name - optional for v1 auth, required otherwise",
+		}, {
+			Name: "tenant_domain",
+			Help: "Tenant domain - optional (v3 auth)",
 		}, {
 			Name: "region",
 			Help: "Region name - optional",
+		}, {
+			Name: "storage_url",
+			Help: "Storage URL - optional",
+		}, {
+			Name: "auth_version",
+			Help: "AuthVersion - optional - set to (1,2,3) if your auth URL has no version",
 		},
 		},
 	})
@@ -75,11 +88,11 @@ func init() {
 
 // Fs represents a remote swift server
 type Fs struct {
-	name              string           // name of this remote
-	c                 swift.Connection // the connection to the swift server
-	container         string           // the container we are working on
-	segmentsContainer string           // container to store the segments (if any) in
-	root              string           // the path we are working on if any
+	name              string            // name of this remote
+	c                 *swift.Connection // the connection to the swift server
+	container         string            // the container we are working on
+	segmentsContainer string            // container to store the segments (if any) in
+	root              string            // the path we are working on if any
 }
 
 // Object describes a swift object
@@ -122,7 +135,7 @@ var matcher = regexp.MustCompile(`^([^/]*)(.*)$`)
 func parsePath(path string) (container, directory string, err error) {
 	parts := matcher.FindStringSubmatch(path)
 	if parts == nil {
-		err = fmt.Errorf("Couldn't find container in swift path %q", path)
+		err = errors.Errorf("couldn't find container in swift path %q", path)
 	} else {
 		container, directory = parts[1], parts[2]
 		directory = strings.Trim(directory, "/")
@@ -148,9 +161,12 @@ func swiftConnection(name string) (*swift.Connection, error) {
 		UserName:       userName,
 		ApiKey:         apiKey,
 		AuthUrl:        authURL,
+		AuthVersion:    fs.ConfigFile.MustInt(name, "auth_version", 0),
 		UserAgent:      fs.UserAgent,
 		Tenant:         fs.ConfigFile.MustValue(name, "tenant"),
 		Region:         fs.ConfigFile.MustValue(name, "region"),
+		Domain:         fs.ConfigFile.MustValue(name, "domain"),
+		TenantDomain:   fs.ConfigFile.MustValue(name, "tenant_domain"),
 		ConnectTimeout: 10 * fs.Config.ConnectTimeout, // Use the timeouts in the transport
 		Timeout:        10 * fs.Config.Timeout,        // Use the timeouts in the transport
 		Transport:      fs.Config.Transport(),
@@ -171,26 +187,30 @@ func NewFsWithConnection(name, root string, c *swift.Connection) (fs.Fs, error) 
 	}
 	f := &Fs{
 		name:              name,
-		c:                 *c,
+		c:                 c,
 		container:         container,
 		segmentsContainer: container + "_segments",
 		root:              directory,
+	}
+	// StorageURL overloading
+	storageURL := fs.ConfigFile.MustValue(name, "storage_url")
+	if storageURL != "" {
+		f.c.StorageUrl = storageURL
+		f.c.Auth = newAuth(f.c.Auth, storageURL)
 	}
 	if f.root != "" {
 		f.root += "/"
 		// Check to see if the object exists - ignoring directory markers
 		info, _, err := f.c.Object(container, directory)
 		if err == nil && info.ContentType != directoryMarkerContentType {
-			remote := path.Base(directory)
 			f.root = path.Dir(directory)
 			if f.root == "." {
 				f.root = ""
 			} else {
 				f.root += "/"
 			}
-			obj := f.NewFsObject(remote)
-			// return a Fs Limited to this object
-			return fs.NewLimited(f, obj), nil
+			// return an error with an fs which points to the parent
+			return f, fs.ErrorIsFile
 		}
 	}
 	return f, nil
@@ -205,15 +225,15 @@ func NewFs(name, root string) (fs.Fs, error) {
 	return NewFsWithConnection(name, root, c)
 }
 
-// Return an FsObject from a path
+// Return an Object from a path
 //
-// May return nil if an error occurred
-func (f *Fs) newFsObjectWithInfo(remote string, info *swift.Object) fs.Object {
+// If it can't be found it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) newObjectWithInfo(remote string, info *swift.Object) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
 	}
-	// Note that due to a quirk of swift, manifest files are
+	// Note that due to a quirk of swift, dynamic large objects are
 	// returned as 0 bytes in the listing.  Correct this here by
 	// making sure we read the full metadata for all 0 byte files.
 	if info != nil && info.Bytes == 0 {
@@ -225,35 +245,41 @@ func (f *Fs) newFsObjectWithInfo(remote string, info *swift.Object) fs.Object {
 	} else {
 		err := o.readMetaData() // reads info and headers, returning an error
 		if err != nil {
-			fs.Debug(o, "Failed to read metadata: %s", err)
-			return nil
+			return nil, err
 		}
 	}
-	return o
+	return o, nil
 }
 
-// NewFsObject returns an FsObject from a path
-//
-// May return nil if an error occurred
-func (f *Fs) NewFsObject(remote string) fs.Object {
-	return f.newFsObjectWithInfo(remote, nil)
+// NewObject finds the Object at remote.  If it can't be found it
+// returns the error fs.ErrorObjectNotFound.
+func (f *Fs) NewObject(remote string) (fs.Object, error) {
+	return f.newObjectWithInfo(remote, nil)
 }
 
-// listFn is called from list and listContainerRoot to handle an object
-type listFn func(string, *swift.Object) error
+// listFn is called from list and listContainerRoot to handle an object.
+type listFn func(remote string, object *swift.Object, isDirectory bool) error
 
 // listContainerRoot lists the objects into the function supplied from
 // the container and root supplied
 //
-// If directories is set it only sends directories
-func (f *Fs) listContainerRoot(container, root string, directories bool, fn listFn) error {
+// Level is the level of the recursion
+func (f *Fs) listContainerRoot(container, root string, dir string, level int, fn listFn) error {
+	prefix := root
+	if dir != "" {
+		prefix += dir + "/"
+	}
 	// Options for ObjectsWalk
 	opts := swift.ObjectsOpts{
-		Prefix: root,
+		Prefix: prefix,
 		Limit:  256,
 	}
-	if directories {
+	switch level {
+	case 1:
 		opts.Delimiter = '/'
+	case fs.MaxLevel:
+	default:
+		return fs.ErrorLevelNotSupported
 	}
 	rootLength := len(root)
 	return f.c.ObjectsWalk(container, &opts, func(opts *swift.ObjectsOpts) (interface{}, error) {
@@ -261,19 +287,19 @@ func (f *Fs) listContainerRoot(container, root string, directories bool, fn list
 		if err == nil {
 			for i := range objects {
 				object := &objects[i]
-				// FIXME if there are no directories, swift gives back the files for some reason!
-				if directories {
-					if !strings.HasSuffix(object.Name, "/") {
-						continue
+				isDirectory := false
+				if level == 1 {
+					if strings.HasSuffix(object.Name, "/") {
+						isDirectory = true
+						object.Name = object.Name[:len(object.Name)-1]
 					}
-					object.Name = object.Name[:len(object.Name)-1]
 				}
 				if !strings.HasPrefix(object.Name, root) {
 					fs.Log(f, "Odd name received %q", object.Name)
 					continue
 				}
 				remote := object.Name[rootLength:]
-				err = fn(remote, object)
+				err = fn(remote, object, isDirectory)
 				if err != nil {
 					break
 				}
@@ -284,86 +310,82 @@ func (f *Fs) listContainerRoot(container, root string, directories bool, fn list
 }
 
 // list the objects into the function supplied
-//
-// If directories is set it only sends directories
-func (f *Fs) list(directories bool, fn listFn) {
-	err := f.listContainerRoot(f.container, f.root, directories, fn)
-	if err != nil {
-		fs.Stats.Error()
-		fs.ErrorLog(f, "Couldn't read container %q: %s", f.container, err)
-	}
+func (f *Fs) list(dir string, level int, fn listFn) error {
+	return f.listContainerRoot(f.container, f.root, dir, level, fn)
 }
 
-// listFiles walks the path returning a channel of FsObjects
-//
-// if ignoreStorable is set then it outputs the file even if Storable() is false
-func (f *Fs) listFiles(ignoreStorable bool) fs.ObjectsChan {
-	out := make(fs.ObjectsChan, fs.Config.Checkers)
+// listFiles walks the path returning a channel of Objects
+func (f *Fs) listFiles(out fs.ListOpts, dir string) {
+	defer out.Finished()
 	if f.container == "" {
-		// Return no objects at top level list
-		close(out)
-		fs.Stats.Error()
-		fs.ErrorLog(f, "Can't list objects at root - choose a container using lsd")
-	} else {
-		// List the objects
-		go func() {
-			defer close(out)
-			f.list(false, func(remote string, object *swift.Object) error {
-				if o := f.newFsObjectWithInfo(remote, object); o != nil {
-					// Storable does a full metadata read on 0 size objects which might be manifest files
-					storable := o.Storable()
-					if storable || ignoreStorable {
-						out <- o
-					}
-				}
-				return nil
-			})
-		}()
+		out.SetError(errors.New("can't list objects at root - choose a container using lsd"))
+		return
 	}
-	return out
-}
-
-// List walks the path returning a channel of FsObjects
-func (f *Fs) List() fs.ObjectsChan {
-	return f.listFiles(false)
-}
-
-// ListDir lists the containers
-func (f *Fs) ListDir() fs.DirChan {
-	out := make(fs.DirChan, fs.Config.Checkers)
-	if f.container == "" {
-		// List the containers
-		go func() {
-			defer close(out)
-			containers, err := f.c.ContainersAll(nil)
+	// List the objects
+	err := f.list(dir, out.Level(), func(remote string, object *swift.Object, isDirectory bool) error {
+		if isDirectory {
+			dir := &fs.Dir{
+				Name:  remote,
+				Bytes: object.Bytes,
+				Count: 0,
+			}
+			if out.AddDir(dir) {
+				return fs.ErrorListAborted
+			}
+		} else {
+			o, err := f.newObjectWithInfo(remote, object)
 			if err != nil {
-				fs.Stats.Error()
-				fs.ErrorLog(f, "Couldn't list containers: %v", err)
-			} else {
-				for _, container := range containers {
-					out <- &fs.Dir{
-						Name:  container.Name,
-						Bytes: container.Bytes,
-						Count: container.Count,
-					}
+				return err
+			}
+			// Storable does a full metadata read on 0 size objects which might be dynamic large objects
+			if o.Storable() {
+				if out.Add(o) {
+					return fs.ErrorListAborted
 				}
 			}
-		}()
-	} else {
-		// List the directories in the path in the container
-		go func() {
-			defer close(out)
-			f.list(true, func(remote string, object *swift.Object) error {
-				out <- &fs.Dir{
-					Name:  remote,
-					Bytes: object.Bytes,
-					Count: 0,
-				}
-				return nil
-			})
-		}()
+		}
+		return nil
+	})
+	if err != nil {
+		if err == swift.ContainerNotFound {
+			err = fs.ErrorDirNotFound
+		}
+		out.SetError(err)
 	}
-	return out
+}
+
+// listContainers lists the containers
+func (f *Fs) listContainers(out fs.ListOpts, dir string) {
+	defer out.Finished()
+	if dir != "" {
+		out.SetError(fs.ErrorListOnlyRoot)
+		return
+	}
+	containers, err := f.c.ContainersAll(nil)
+	if err != nil {
+		out.SetError(err)
+		return
+	}
+	for _, container := range containers {
+		dir := &fs.Dir{
+			Name:  container.Name,
+			Bytes: container.Bytes,
+			Count: container.Count,
+		}
+		if out.AddDir(dir) {
+			break
+		}
+	}
+}
+
+// List walks the path returning files and directories to out
+func (f *Fs) List(out fs.ListOpts, dir string) {
+	if f.container == "" {
+		f.listContainers(out, dir)
+	} else {
+		f.listFiles(out, dir)
+	}
+	return
 }
 
 // Put the object into the container
@@ -371,13 +393,13 @@ func (f *Fs) ListDir() fs.DirChan {
 // Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
-func (f *Fs) Put(in io.Reader, remote string, modTime time.Time, size int64) (fs.Object, error) {
+func (f *Fs) Put(in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
 	// Temporary Object under construction
 	fs := &Object{
 		fs:     f,
-		remote: remote,
+		remote: src.Remote(),
 	}
-	return fs, fs.Update(in, modTime, size)
+	return fs, fs.Update(in, src)
 }
 
 // Mkdir creates the container if it doesn't exist
@@ -413,7 +435,30 @@ func (f *Fs) Precision() time.Duration {
 //
 // Implemented here so we can make sure we delete directory markers
 func (f *Fs) Purge() error {
-	fs.DeleteFiles(f.listFiles(true))
+	// Delete all the files including the directory markers
+	toBeDeleted := make(chan fs.Object, fs.Config.Transfers)
+	delErr := make(chan error, 1)
+	go func() {
+		delErr <- fs.DeleteFiles(toBeDeleted)
+	}()
+	err := f.list("", fs.MaxLevel, func(remote string, object *swift.Object, isDirectory bool) error {
+		if !isDirectory {
+			o, err := f.newObjectWithInfo(remote, object)
+			if err != nil {
+				return err
+			}
+			toBeDeleted <- o
+		}
+		return nil
+	})
+	close(toBeDeleted)
+	delError := <-delErr
+	if err == nil {
+		err = delError
+	}
+	if err != nil {
+		return err
+	}
 	return f.Rmdir()
 }
 
@@ -437,7 +482,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	return f.NewFsObject(remote), nil
+	return f.NewObject(remote)
 }
 
 // Hashes returns the supported hash sets.
@@ -448,7 +493,7 @@ func (f *Fs) Hashes() fs.HashSet {
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
-func (o *Object) Fs() fs.Fs {
+func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
@@ -470,28 +515,43 @@ func (o *Object) Hash(t fs.HashType) (string, error) {
 	if t != fs.HashMD5 {
 		return "", fs.ErrHashUnsupported
 	}
-	isManifest, err := o.isManifestFile()
+	isDynamicLargeObject, err := o.isDynamicLargeObject()
 	if err != nil {
 		return "", err
 	}
-	if isManifest {
-		fs.Debug(o, "Returning empty Md5sum for swift manifest file")
+	isStaticLargeObject, err := o.isStaticLargeObject()
+	if err != nil {
+		return "", err
+	}
+	if isDynamicLargeObject || isStaticLargeObject {
+		fs.Debug(o, "Returning empty Md5sum for swift large object")
 		return "", nil
 	}
 	return strings.ToLower(o.info.Hash), nil
 }
 
-// isManifestFile checks for manifest header
-func (o *Object) isManifestFile() (bool, error) {
+// hasHeader checks for the header passed in returning false if the
+// object isn't found.
+func (o *Object) hasHeader(header string) (bool, error) {
 	err := o.readMetaData()
 	if err != nil {
-		if err == swift.ObjectNotFound {
+		if err == fs.ErrorObjectNotFound {
 			return false, nil
 		}
 		return false, err
 	}
-	_, isManifestFile := (*o.headers)["X-Object-Manifest"]
-	return isManifestFile, nil
+	_, isDynamicLargeObject := (*o.headers)[header]
+	return isDynamicLargeObject, nil
+}
+
+// isDynamicLargeObject checks for X-Object-Manifest header
+func (o *Object) isDynamicLargeObject() (bool, error) {
+	return o.hasHeader("X-Object-Manifest")
+}
+
+// isStaticLargeObjectFile checks for the X-Static-Large-Object header
+func (o *Object) isStaticLargeObject() (bool, error) {
+	return o.hasHeader("X-Static-Large-Object")
 }
 
 // Size returns the size of an object in bytes
@@ -502,12 +562,17 @@ func (o *Object) Size() int64 {
 // readMetaData gets the metadata if it hasn't already been fetched
 //
 // it also sets the info
+//
+// it returns fs.ErrorObjectNotFound if the object isn't found
 func (o *Object) readMetaData() (err error) {
 	if o.headers != nil {
 		return nil
 	}
 	info, h, err := o.fs.c.Object(o.fs.container, o.fs.root+o.remote)
 	if err != nil {
+		if err == swift.ObjectNotFound {
+			return fs.ErrorObjectNotFound
+		}
 		return err
 	}
 	o.info = info
@@ -528,19 +593,17 @@ func (o *Object) ModTime() time.Time {
 	}
 	modTime, err := o.headers.ObjectMetadata().GetModTime()
 	if err != nil {
-		// fs.Log(o, "Failed to read mtime from object: %s", err)
+		// fs.Log(o, "Failed to read mtime from object: %v", err)
 		return o.info.LastModified
 	}
 	return modTime
 }
 
 // SetModTime sets the modification time of the local fs object
-func (o *Object) SetModTime(modTime time.Time) {
+func (o *Object) SetModTime(modTime time.Time) error {
 	err := o.readMetaData()
 	if err != nil {
-		fs.Stats.Error()
-		fs.ErrorLog(o, "Failed to read metadata: %s", err)
-		return
+		return err
 	}
 	meta := o.headers.ObjectMetadata()
 	meta.SetModTime(modTime)
@@ -554,11 +617,7 @@ func (o *Object) SetModTime(modTime time.Time) {
 			newHeaders[k] = v
 		}
 	}
-	err = o.fs.c.ObjectUpdate(o.fs.container, o.fs.root+o.remote, newHeaders)
-	if err != nil {
-		fs.Stats.Error()
-		fs.ErrorLog(o, "Failed to update remote mtime: %s", err)
-	}
+	return o.fs.c.ObjectUpdate(o.fs.container, o.fs.root+o.remote, newHeaders)
 }
 
 // Storable returns if this object is storable
@@ -588,7 +647,10 @@ func min(x, y int64) int64 {
 // if except is passed in then segments with that prefix won't be deleted
 func (o *Object) removeSegments(except string) error {
 	segmentsRoot := o.fs.root + o.remote + "/"
-	err := o.fs.listContainerRoot(o.fs.segmentsContainer, segmentsRoot, false, func(remote string, object *swift.Object) error {
+	err := o.fs.listContainerRoot(o.fs.segmentsContainer, segmentsRoot, "", fs.MaxLevel, func(remote string, object *swift.Object, isDirectory bool) error {
+		if isDirectory {
+			return nil
+		}
 		if except != "" && strings.HasPrefix(remote, except) {
 			// fs.Debug(o, "Ignoring current segment file %q in container %q", segmentsRoot+remote, o.fs.segmentsContainer)
 			return nil
@@ -606,6 +668,23 @@ func (o *Object) removeSegments(except string) error {
 		fs.Debug(o, "Removed empty container %q", o.fs.segmentsContainer)
 	}
 	return nil
+}
+
+// urlEncode encodes a string so that it is a valid URL
+//
+// We don't use any of Go's standard methods as we need `/` not
+// encoded but we need '&' encoded.
+func urlEncode(str string) string {
+	var buf bytes.Buffer
+	for i := 0; i < len(str); i++ {
+		c := str[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '/' || c == '.' {
+			_ = buf.WriteByte(c)
+		} else {
+			_, _ = buf.WriteString(fmt.Sprintf("%%%02X", c))
+		}
+	}
+	return buf.String()
 }
 
 // updateChunks updates the existing object using chunks to a separate
@@ -635,7 +714,7 @@ func (o *Object) updateChunks(in io.Reader, headers swift.Headers, size int64) (
 		i++
 	}
 	// Upload the manifest
-	headers["X-Object-Manifest"] = fmt.Sprintf("%s/%s", o.fs.segmentsContainer, segmentsPath)
+	headers["X-Object-Manifest"] = urlEncode(fmt.Sprintf("%s/%s", o.fs.segmentsContainer, segmentsPath))
 	headers["Content-Length"] = "0" // set Content-Length as we know it
 	emptyReader := bytes.NewReader(nil)
 	manifestName := o.fs.root + o.remote
@@ -646,9 +725,12 @@ func (o *Object) updateChunks(in io.Reader, headers swift.Headers, size int64) (
 // Update the object with the contents of the io.Reader, modTime and size
 //
 // The new object may have been created if an error is returned
-func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
-	// Note whether this has a manifest before starting
-	isManifest, err := o.isManifestFile()
+func (o *Object) Update(in io.Reader, src fs.ObjectInfo) error {
+	size := src.Size()
+	modTime := src.ModTime()
+
+	// Note whether this is a dynamic large object before starting
+	isDynamicLargeObject, err := o.isDynamicLargeObject()
 	if err != nil {
 		return err
 	}
@@ -671,8 +753,8 @@ func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
 		}
 	}
 
-	// If file was a manifest then remove old/all segments
-	if isManifest {
+	// If file was a dynamic large object then remove old/all segments
+	if isDynamicLargeObject {
 		err = o.removeSegments(uniquePrefix)
 		if err != nil {
 			fs.Log(o, "Failed to remove old segments - carrying on with upload: %v", err)
@@ -686,7 +768,7 @@ func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
 
 // Remove an object
 func (o *Object) Remove() error {
-	isManifestFile, err := o.isManifestFile()
+	isDynamicLargeObject, err := o.isDynamicLargeObject()
 	if err != nil {
 		return err
 	}
@@ -696,7 +778,7 @@ func (o *Object) Remove() error {
 		return err
 	}
 	// ...then segments if required
-	if isManifestFile {
+	if isDynamicLargeObject {
 		err = o.removeSegments("")
 		if err != nil {
 			return err

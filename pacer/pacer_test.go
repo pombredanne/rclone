@@ -6,9 +6,12 @@ import (
 	"time"
 
 	"github.com/ncw/rclone/fs"
+	"github.com/pkg/errors"
 )
 
 func TestNew(t *testing.T) {
+	const expectedRetries = 7
+	fs.Config.LowLevelRetries = expectedRetries
 	p := New()
 	if p.minSleep != 10*time.Millisecond {
 		t.Errorf("minSleep")
@@ -19,11 +22,14 @@ func TestNew(t *testing.T) {
 	if p.sleepTime != p.minSleep {
 		t.Errorf("sleepTime")
 	}
-	if p.retries != 10 {
-		t.Errorf("retries")
+	if p.retries != expectedRetries {
+		t.Errorf("retries want %v got %v", expectedRetries, p.retries)
 	}
 	if p.decayConstant != 2 {
 		t.Errorf("decayConstant")
+	}
+	if p.attackConstant != 1 {
+		t.Errorf("attackConstant")
 	}
 	if cap(p.pacer) != 1 {
 		t.Errorf("pacer 1")
@@ -42,6 +48,20 @@ func TestNew(t *testing.T) {
 	}
 	if p.consecutiveRetries != 0 {
 		t.Errorf("consecutiveRetries")
+	}
+}
+
+func TestSetSleep(t *testing.T) {
+	p := New().SetSleep(2 * time.Millisecond)
+	if p.sleepTime != 2*time.Millisecond {
+		t.Errorf("didn't set")
+	}
+}
+
+func TestGetSleep(t *testing.T) {
+	p := New().SetSleep(2 * time.Millisecond)
+	if p.GetSleep() != 2*time.Millisecond {
+		t.Errorf("didn't get")
 	}
 }
 
@@ -81,6 +101,58 @@ func TestSetDecayConstant(t *testing.T) {
 	if p.decayConstant != 17 {
 		t.Errorf("didn't set")
 	}
+}
+
+func TestDecay(t *testing.T) {
+	p := New().SetMinSleep(time.Microsecond).SetPacer(DefaultPacer).SetMaxSleep(time.Second)
+	for _, test := range []struct {
+		in             time.Duration
+		attackConstant uint
+		want           time.Duration
+	}{
+		{8 * time.Millisecond, 1, 4 * time.Millisecond},
+		{1 * time.Millisecond, 0, time.Microsecond},
+		{1 * time.Millisecond, 2, (3 * time.Millisecond) / 4},
+		{1 * time.Millisecond, 3, (7 * time.Millisecond) / 8},
+	} {
+		p.sleepTime = test.in
+		p.SetDecayConstant(test.attackConstant)
+		p.defaultPacer(false)
+		got := p.sleepTime
+		if got != test.want {
+			t.Errorf("bad sleep want %v got %v", test.want, got)
+		}
+	}
+}
+
+func TestSetAttackConstant(t *testing.T) {
+	p := New().SetAttackConstant(19)
+	if p.attackConstant != 19 {
+		t.Errorf("didn't set")
+	}
+}
+
+func TestAttack(t *testing.T) {
+	p := New().SetMinSleep(time.Microsecond).SetPacer(DefaultPacer).SetMaxSleep(time.Second)
+	for _, test := range []struct {
+		in             time.Duration
+		attackConstant uint
+		want           time.Duration
+	}{
+		{1 * time.Millisecond, 1, 2 * time.Millisecond},
+		{1 * time.Millisecond, 0, time.Second},
+		{1 * time.Millisecond, 2, (4 * time.Millisecond) / 3},
+		{1 * time.Millisecond, 3, (8 * time.Millisecond) / 7},
+	} {
+		p.sleepTime = test.in
+		p.SetAttackConstant(test.attackConstant)
+		p.defaultPacer(true)
+		got := p.sleepTime
+		if got != test.want {
+			t.Errorf("bad sleep want %v got %v", test.want, got)
+		}
+	}
+
 }
 
 func TestSetRetries(t *testing.T) {
@@ -253,7 +325,7 @@ func TestEndCallZeroConnections(t *testing.T) {
 	}
 }
 
-var errFoo = fmt.Errorf("Foo")
+var errFoo = errors.New("foo")
 
 type dummyPaced struct {
 	retry  bool
@@ -289,7 +361,7 @@ func Test_callRetry(t *testing.T) {
 	if err == errFoo {
 		t.Errorf("err didn't want %v got %v", errFoo, err)
 	}
-	_, ok := err.(fs.Retry)
+	_, ok := err.(fs.Retrier)
 	if !ok {
 		t.Errorf("didn't return a retry error")
 	}
@@ -303,7 +375,7 @@ func TestCall(t *testing.T) {
 	if dp.called != 20 {
 		t.Errorf("called want %d got %d", 20, dp.called)
 	}
-	_, ok := err.(fs.Retry)
+	_, ok := err.(fs.Retrier)
 	if !ok {
 		t.Errorf("didn't return a retry error")
 	}
@@ -317,7 +389,7 @@ func TestCallNoRetry(t *testing.T) {
 	if dp.called != 1 {
 		t.Errorf("called want %d got %d", 1, dp.called)
 	}
-	_, ok := err.(fs.Retry)
+	_, ok := err.(fs.Retrier)
 	if !ok {
 		t.Errorf("didn't return a retry error")
 	}

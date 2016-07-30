@@ -2,8 +2,12 @@ package api
 
 import (
 	"fmt"
+	"path"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/ncw/rclone/fs"
 )
 
 // Error describes a B2 error response
@@ -17,6 +21,15 @@ type Error struct {
 func (e *Error) Error() string {
 	return fmt.Sprintf("%s (%d %s)", e.Message, e.Status, e.Code)
 }
+
+// Fatal statisfies the Fatal interface
+//
+// It indicates which errors should be treated as fatal
+func (e *Error) Fatal() bool {
+	return e.Status == 403 // 403 errors shouldn't be retried
+}
+
+var _ fs.Fataler = (*Error)(nil)
 
 // Account describes a B2 account
 type Account struct {
@@ -51,17 +64,75 @@ func (t *Timestamp) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	*t = Timestamp(time.Unix(timestamp/1E3, (timestamp%1E3)*1E6))
+	*t = Timestamp(time.Unix(timestamp/1E3, (timestamp%1E3)*1E6).UTC())
 	return nil
+}
+
+const versionFormat = "-v2006-01-02-150405.000"
+
+// AddVersion adds the timestamp as a version string into the filename passed in.
+func (t Timestamp) AddVersion(remote string) string {
+	ext := path.Ext(remote)
+	base := remote[:len(remote)-len(ext)]
+	s := (time.Time)(t).Format(versionFormat)
+	// Replace the '.' with a '-'
+	s = strings.Replace(s, ".", "-", -1)
+	return base + s + ext
+}
+
+// RemoveVersion removes the timestamp from a filename as a version string.
+//
+// It returns the new file name and a timestamp, or the old filename
+// and a zero timestamp.
+func RemoveVersion(remote string) (t Timestamp, newRemote string) {
+	newRemote = remote
+	ext := path.Ext(remote)
+	base := remote[:len(remote)-len(ext)]
+	if len(base) < len(versionFormat) {
+		return
+	}
+	versionStart := len(base) - len(versionFormat)
+	// Check it ends in -xxx
+	if base[len(base)-4] != '-' {
+		return
+	}
+	// Replace with .xxx for parsing
+	base = base[:len(base)-4] + "." + base[len(base)-3:]
+	newT, err := time.Parse(versionFormat, base[versionStart:])
+	if err != nil {
+		return
+	}
+	return Timestamp(newT), base[:versionStart] + ext
+}
+
+// IsZero returns true if the timestamp is unitialised
+func (t Timestamp) IsZero() bool {
+	return (time.Time)(t).IsZero()
+}
+
+// Equal compares two timestamps
+//
+// If either are !IsZero then it returns false
+func (t Timestamp) Equal(s Timestamp) bool {
+	if (time.Time)(t).IsZero() {
+		return false
+	}
+	if (time.Time)(s).IsZero() {
+		return false
+	}
+	return (time.Time)(t).Equal((time.Time)(s))
 }
 
 // File is info about a file
 type File struct {
-	ID              string    `json:"fileId"`          // The unique identifier for this version of this file. Used with b2_get_file_info, b2_download_file_by_id, and b2_delete_file_version.
-	Name            string    `json:"fileName"`        // The name of this file, which can be used with b2_download_file_by_name.
-	Action          string    `json:"action"`          // Either "upload" or "hide". "upload" means a file that was uploaded to B2 Cloud Storage. "hide" means a file version marking the file as hidden, so that it will not show up in b2_list_file_names. The result of b2_list_file_names will contain only "upload". The result of b2_list_file_versions may have both.
-	Size            int64     `json:"size"`            // The number of bytes in the file.
-	UploadTimestamp Timestamp `json:"uploadTimestamp"` // This is a UTC time when this file was uploaded.
+	ID              string            `json:"fileId"`          // The unique identifier for this version of this file. Used with b2_get_file_info, b2_download_file_by_id, and b2_delete_file_version.
+	Name            string            `json:"fileName"`        // The name of this file, which can be used with b2_download_file_by_name.
+	Action          string            `json:"action"`          // Either "upload" or "hide". "upload" means a file that was uploaded to B2 Cloud Storage. "hide" means a file version marking the file as hidden, so that it will not show up in b2_list_file_names. The result of b2_list_file_names will contain only "upload". The result of b2_list_file_versions may have both.
+	Size            int64             `json:"size"`            // The number of bytes in the file.
+	UploadTimestamp Timestamp         `json:"uploadTimestamp"` // This is a UTC time when this file was uploaded.
+	SHA1            string            `json:"contentSha1"`     // The SHA1 of the bytes stored in the file.
+	ContentType     string            `json:"contentType"`     // The MIME type of the file.
+	Info            map[string]string `json:"fileInfo"`        // The custom information that was uploaded with the file. This is a JSON object, holding the name/value pairs that were uploaded with the file.
 }
 
 // AuthorizeAccountResponse is as returned from the b2_authorize_account call
@@ -104,16 +175,18 @@ type GetUploadURLResponse struct {
 	AuthorizationToken string `json:"authorizationToken"` // The authorizationToken that must be used when uploading files to this bucket, see b2_upload_file.
 }
 
-// FileInfo is received from b2_upload_file and b2_get_file_info
+// FileInfo is received from b2_upload_file, b2_get_file_info and b2_finish_large_file
 type FileInfo struct {
-	ID          string            `json:"fileId"`        // The unique identifier for this version of this file. Used with b2_get_file_info, b2_download_file_by_id, and b2_delete_file_version.
-	Name        string            `json:"fileName"`      // The name of this file, which can be used with b2_download_file_by_name.
-	AccountID   string            `json:"accountId"`     // Your account ID.
-	BucketID    string            `json:"bucketId"`      // The bucket that the file is in.
-	Size        int64             `json:"contentLength"` // The number of bytes stored in the file.
-	SHA1        string            `json:"contentSha1"`   // The SHA1 of the bytes stored in the file.
-	ContentType string            `json:"contentType"`   // The MIME type of the file.
-	Info        map[string]string `json:"fileInfo"`      // The custom information that was uploaded with the file. This is a JSON object, holding the name/value pairs that were uploaded with the file.
+	ID              string            `json:"fileId"`          // The unique identifier for this version of this file. Used with b2_get_file_info, b2_download_file_by_id, and b2_delete_file_version.
+	Name            string            `json:"fileName"`        // The name of this file, which can be used with b2_download_file_by_name.
+	Action          string            `json:"action"`          // Either "upload" or "hide". "upload" means a file that was uploaded to B2 Cloud Storage. "hide" means a file version marking the file as hidden, so that it will not show up in b2_list_file_names. The result of b2_list_file_names will contain only "upload". The result of b2_list_file_versions may have both.
+	AccountID       string            `json:"accountId"`       // Your account ID.
+	BucketID        string            `json:"bucketId"`        // The bucket that the file is in.
+	Size            int64             `json:"contentLength"`   // The number of bytes stored in the file.
+	UploadTimestamp Timestamp         `json:"uploadTimestamp"` // This is a UTC time when this file was uploaded.
+	SHA1            string            `json:"contentSha1"`     // The SHA1 of the bytes stored in the file.
+	ContentType     string            `json:"contentType"`     // The MIME type of the file.
+	Info            map[string]string `json:"fileInfo"`        // The custom information that was uploaded with the file. This is a JSON object, holding the name/value pairs that were uploaded with the file.
 }
 
 // CreateBucketRequest is used to create a bucket
@@ -144,4 +217,83 @@ type HideFileRequest struct {
 // GetFileInfoRequest is used to return a FileInfo struct with b2_get_file_info
 type GetFileInfoRequest struct {
 	ID string `json:"fileId"` // The ID of the file, as returned by b2_upload_file, b2_list_file_names, or b2_list_file_versions.
+}
+
+// StartLargeFileRequest (b2_start_large_file) Prepares for uploading the parts of a large file.
+//
+// If the original source of the file being uploaded has a last
+// modified time concept, Backblaze recommends using
+// src_last_modified_millis as the name, and a string holding the base
+// 10 number number of milliseconds since midnight, January 1, 1970
+// UTC. This fits in a 64 bit integer such as the type "long" in the
+// programming language Java. It is intended to be compatible with
+// Java's time long. For example, it can be passed directly into the
+// Java call Date.setTime(long time).
+//
+// If the caller knows the SHA1 of the entire large file being
+// uploaded, Backblaze recommends using large_file_sha1 as the name,
+// and a 40 byte hex string representing the SHA1.
+//
+// Example: { "src_last_modified_millis" : "1452802803026", "large_file_sha1" : "a3195dc1e7b46a2ff5da4b3c179175b75671e80d", "color": "blue" }
+type StartLargeFileRequest struct {
+	BucketID    string            `json:"bucketId"`    //The ID of the bucket that the file will go in.
+	Name        string            `json:"fileName"`    // The name of the file. See Files for requirements on file names.
+	ContentType string            `json:"contentType"` // The MIME type of the content of the file, which will be returned in the Content-Type header when downloading the file. Use the Content-Type b2/x-auto to automatically set the stored Content-Type post upload. In the case where a file extension is absent or the lookup fails, the Content-Type is set to application/octet-stream.
+	Info        map[string]string `json:"fileInfo"`    // A JSON object holding the name/value pairs for the custom file info.
+}
+
+// StartLargeFileResponse is the response to StartLargeFileRequest
+type StartLargeFileResponse struct {
+	ID              string            `json:"fileId"`          // The unique identifier for this version of this file. Used with b2_get_file_info, b2_download_file_by_id, and b2_delete_file_version.
+	Name            string            `json:"fileName"`        // The name of this file, which can be used with b2_download_file_by_name.
+	AccountID       string            `json:"accountId"`       // The identifier for the account.
+	BucketID        string            `json:"bucketId"`        // The unique ID of the bucket.
+	ContentType     string            `json:"contentType"`     // The MIME type of the file.
+	Info            map[string]string `json:"fileInfo"`        // The custom information that was uploaded with the file. This is a JSON object, holding the name/value pairs that were uploaded with the file.
+	UploadTimestamp Timestamp         `json:"uploadTimestamp"` // This is a UTC time when this file was uploaded.
+}
+
+// GetUploadPartURLRequest is passed to b2_get_upload_part_url
+type GetUploadPartURLRequest struct {
+	ID string `json:"fileId"` // The unique identifier of the file being uploaded.
+}
+
+// GetUploadPartURLResponse is received from b2_get_upload_url
+type GetUploadPartURLResponse struct {
+	ID                 string `json:"fileId"`             // The unique identifier of the file being uploaded.
+	UploadURL          string `json:"uploadUrl"`          // The URL that can be used to upload files to this bucket, see b2_upload_part.
+	AuthorizationToken string `json:"authorizationToken"` // The authorizationToken that must be used when uploading files to this bucket, see b2_upload_part.
+}
+
+// UploadPartResponse is the response to b2_upload_part
+type UploadPartResponse struct {
+	ID         string `json:"fileId"`        // The unique identifier of the file being uploaded.
+	PartNumber int64  `json:"partNumber"`    // Which part this is (starting from 1)
+	Size       int64  `json:"contentLength"` // The number of bytes stored in the file.
+	SHA1       string `json:"contentSha1"`   // The SHA1 of the bytes stored in the file.
+}
+
+// FinishLargeFileRequest is passed to b2_finish_large_file
+//
+// The response is a FileInfo object (with extra AccountID and BucketID fields which we ignore).
+//
+// Large files do not have a SHA1 checksum. The value will always be "none".
+type FinishLargeFileRequest struct {
+	ID    string   `json:"fileId"`        // The unique identifier of the file being uploaded.
+	SHA1s []string `json:"partSha1Array"` // A JSON array of hex SHA1 checksums of the parts of the large file. This is a double-check that the right parts were uploaded in the right order, and that none were missed. Note that the part numbers start at 1, and the SHA1 of the part 1 is the first string in the array, at index 0.
+}
+
+// CancelLargeFileRequest is passed to b2_finish_large_file
+//
+// The response is a CancelLargeFileResponse
+type CancelLargeFileRequest struct {
+	ID string `json:"fileId"` // The unique identifier of the file being uploaded.
+}
+
+// CancelLargeFileResponse is the response to CancelLargeFileRequest
+type CancelLargeFileResponse struct {
+	ID        string `json:"fileId"`    // The unique identifier of the file being uploaded.
+	Name      string `json:"fileName"`  // The name of this file.
+	AccountID string `json:"accountId"` // The identifier for the account.
+	BucketID  string `json:"bucketId"`  // The unique ID of the bucket.
 }

@@ -1,12 +1,149 @@
 ---
 title: "Documentation"
 description: "Rclone Changelog"
-date: "2015-01-31"
+date: "2016-07-13"
 ---
 
 Changelog
 ---------
 
+  * v1.32 - 2016-07-13
+    * Backblaze B2
+      * Fix upload of files large files not in root
+  * v1.31 - 2016-07-13
+    * New Features
+      * Reduce memory on sync by about 50%
+      * Implement --no-traverse flag to stop copy traversing the destination remote.
+        * This can be used to reduce memory usage down to the smallest possible.
+        * Useful to copy a small number of files into a large destination folder.
+      * Implement cleanup command for emptying trash / removing old versions of files
+        * Currently B2 only
+      * Single file handling improved
+        * Now copied with --files-from
+        * Automatically sets --no-traverse when copying a single file
+      * Info on using installing with ansible - thanks Stefan Weichinger
+      * Implement --no-update-modtime flag to stop rclone fixing the remote modified times.
+    * Bug Fixes
+      * Fix move command - stop it running for overlapping Fses - this was causing data loss.
+    * Local
+      * Fix incomplete hashes - this was causing problems for B2.
+    * Amazon Drive
+      * Rename Amazon Cloud Drive to Amazon Drive - no changes to config file needed.
+    * Swift
+      * Add support for non-default project domain - thanks Antonio Messina.
+    * S3
+      * Add instructions on how to use rclone with minio.
+      * Add ap-northeast-2 (Seoul) and ap-south-1 (Mumbai) regions.
+      * Skip setting the modified time for objects > 5GB as it isn't possible.
+    * Backblaze B2
+      * Add --b2-versions flag so old versions can be listed and retreived.
+      * Treat 403 errors (eg cap exceeded) as fatal.
+      * Implement cleanup command for deleting old file versions.
+      * Make error handling compliant with B2 integrations notes.
+      * Fix handling of token expiry.
+      * Implement --b2-test-mode to set `X-Bz-Test-Mode` header.
+      * Set cutoff for chunked upload to 200MB as per B2 guidelines.
+      * Make upload multi-threaded.
+    * Dropbox
+      * Don't retry 461 errors.
+  * v1.30 - 2016-06-18
+    * New Features
+      * Directory listing code reworked for more features and better error reporting (thanks to Klaus Post for help).  This enables
+        * Directory include filtering for efficiency
+        * --max-depth parameter
+        * Better error reporting
+        * More to come
+      * Retry more errors
+      * Add --ignore-size flag - for uploading images to onedrive
+      * Log -v output to stdout by default
+      * Display the transfer stats in more human readable form
+      * Make 0 size files specifiable with `--max-size 0b`
+      * Add `b` suffix so we can specify bytes in --bwlimit, --min-size etc
+      * Use "password:" instead of "password>" prompt - thanks Klaus Post and Leigh Klotz
+    * Bug Fixes
+      * Fix retry doing one too many retries
+    * Local
+      * Fix problems with OS X and UTF-8 characters
+    * Amazon Drive
+      * Check a file exists before uploading to help with 408 Conflict errors
+      * Reauth on 401 errors - this has been causing a lot of problems
+      * Work around spurious 403 errors
+      * Restart directory listings on error
+    * Google Drive
+      * Check a file exists before uploading to help with duplicates
+      * Fix retry of multipart uploads
+    * Backblaze B2
+      * Implement large file uploading
+    * S3
+      * Add AES256 server-side encryption for - thanks Justin R. Wilson
+    * Google Cloud Storage
+      * Make sure we don't use conflicting content types on upload
+      * Add service account support - thanks Michal Witkowski
+    * Swift
+      * Add auth version parameter
+      * Add domain option for openstack (v3 auth) - thanks Fabian Ruff
+  * v1.29 - 2016-04-18
+    * New Features
+      * Implement `-I, --ignore-times` for unconditional upload
+      * Improve `dedupe`command
+        * Now removes identical copies without asking
+        * Now obeys `--dry-run`
+        * Implement `--dedupe-mode` for non interactive running
+          * `--dedupe-mode interactive` - interactive the default.
+          * `--dedupe-mode skip` - removes identical files then skips anything left.
+          * `--dedupe-mode first` - removes identical files then keeps the first one.
+          * `--dedupe-mode newest` - removes identical files then keeps the newest one.
+          * `--dedupe-mode oldest` - removes identical files then keeps the oldest one.
+          * `--dedupe-mode rename` - removes identical files then renames the rest to be different.
+    * Bug fixes
+      * Make rclone check obey the `--size-only` flag.
+      * Use "application/octet-stream" if discovered mime type is invalid.
+      * Fix missing "quit" option when there are no remotes.
+    * Google Drive
+      * Increase default chunk size to 8 MB - increases upload speed of big files
+      * Speed up directory listings and make more reliable
+      * Add missing retries for Move and DirMove - increases reliability
+      * Preserve mime type on file update
+    * Backblaze B2
+      * Enable mod time syncing
+        * This means that B2 will now check modification times
+        * It will upload new files to update the modification times
+        * (there isn't an API to just set the mod time.)
+        * If you want the old behaviour use `--size-only`.
+      * Update API to new version
+      * Fix parsing of mod time when not in metadata
+    * Swift/Hubic
+      * Don't return an MD5SUM for static large objects
+    * S3
+      * Fix uploading files bigger than 50GB
+  * v1.28 - 2016-03-01
+    * New Features
+      * Configuration file encryption - thanks Klaus Post
+      * Improve `rclone config` adding more help and making it easier to understand
+      * Implement `-u`/`--update` so creation times can be used on all remotes
+      * Implement `--low-level-retries` flag
+      * Optionally disable gzip compression on downloads with `--no-gzip-encoding`
+    * Bug fixes
+      * Don't make directories if `--dry-run` set
+      * Fix and document the `move` command
+      * Fix redirecting stderr on unix-like OSes when using `--log-file`
+      * Fix `delete` command to wait until all finished - fixes missing deletes.
+    * Backblaze B2
+      * Use one upload URL per go routine fixes `more than one upload using auth token`
+      * Add pacing, retries and reauthentication - fixes token expiry problems
+      * Upload without using a temporary file from local (and remotes which support SHA1)
+      * Fix reading metadata for all files when it shouldn't have been
+    * Drive
+      * Fix listing drive documents at root
+      * Disable copy and move for Google docs
+    * Swift
+      * Fix uploading of chunked files with non ASCII characters
+      * Allow setting of `storage_url` in the config - thanks Xavier Lucas
+    * S3
+      * Allow IAM role and credentials from environment variables - thanks Brian Stengaard
+      * Allow low privilege users to use S3 (check if directory exists during Mkdir) - thanks Jakub Gedeon
+    * Amazon Drive
+      * Retry on more things to make directory listings more reliable
   * v1.27 - 2016-01-31
     * New Features
       * Easier headless configuration with `rclone authorize`
@@ -19,7 +156,7 @@ Changelog
       * Warn the user about files with same name but different case
       * Make `--include` rules add their implict exclude * at the end of the filter list
       * Deprecate compiling with go1.3
-    * Amazon Cloud Drive
+    * Amazon Drive
       * Fix download of files > 10 GB
       * Fix directory traversal ("Next token is expired") for large directory listings
       * Remove 409 conflict from error codes we will retry - stops very long pauses
@@ -102,13 +239,13 @@ Changelog
       * Make lsl output times in localtime
     * Fixes
       * Fix allowing user to override credentials again in Drive, GCS and ACD
-    * Amazon Cloud Drive
+    * Amazon Drive
       * Implement compliant pacing scheme
     * Google Drive
       * Make directory reads concurrent for increased speed.
   * v1.20 - 2015-09-15
     * New features
-      * Amazon Cloud Drive support
+      * Amazon Drive support
       * Oauth support redone - fix many bugs and improve usability
         * Use "golang.org/x/oauth2" as oauth libary of choice
         * Improve oauth usability for smoother initial signup

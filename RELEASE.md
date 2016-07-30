@@ -8,11 +8,12 @@ Required software for making a release
   * golint - go get github.com/golang/lint
 
 Making a release
-  * go get -u -f -v ./...
+  * make update
   * make check
   * make test
   * make tag
   * edit docs/content/changelog.md
+  * make doc
   * git commit -a -v
   * make retag
   * # Set the GOPATH for a gox enabled compiler - . ~/bin/go-cross - not required for go >= 1.5

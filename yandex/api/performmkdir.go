@@ -1,9 +1,10 @@
 package src
 
 import (
-	"fmt"
 	"io/ioutil"
 	"net/http"
+
+	"github.com/pkg/errors"
 )
 
 // PerformMkdir does the actual mkdir via PUT request.
@@ -16,7 +17,7 @@ func (c *Client) PerformMkdir(url string) (int, string, error) {
 	//set access token and headers
 	c.setRequestScope(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return 0, "", err
 	}
@@ -27,7 +28,7 @@ func (c *Client) PerformMkdir(url string) (int, string, error) {
 			return 0, "", err
 		}
 		//third parameter is the json error response body
-		return resp.StatusCode, string(body[:]), fmt.Errorf("Create Folder error [%d]: %s", resp.StatusCode, string(body[:]))
+		return resp.StatusCode, string(body[:]), errors.Errorf("create folder error [%d]: %s", resp.StatusCode, string(body[:]))
 	}
 	return resp.StatusCode, "", nil
 }

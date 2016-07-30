@@ -7,15 +7,33 @@ rclone:
 	@go version
 	go install -v ./...
 
+# Full suite of integration tests
 test:	rclone
 	go test ./...
 	cd fs && go run test_all.go
 
+# Quick test
+quicktest:
+	go test ./...
+	go test -cpu=2 -race ./...
+
+# Do source code quality checks
 check:	rclone
 	go vet ./...
-	[[ `go version` =~ go1.[0-4][^0-9] ]] || errcheck ./...
+	errcheck ./...
 	goimports -d . | grep . ; test $$? -eq 1
 	golint ./... | grep -E -v '(StorageUrl|CdnUrl)' ; test $$? -eq 1
+
+# Get the build dependencies
+build_dep:
+	go get -t ./...
+	go get -u github.com/kisielk/errcheck
+	go get -u golang.org/x/tools/cmd/goimports
+	go get -u github.com/golang/lint/golint
+
+# Update dependencies
+update:
+	go get -t -u -f -v ./...
 
 doc:	rclone.1 MANUAL.html MANUAL.txt
 
@@ -56,7 +74,7 @@ upload_github:
 cross:	doc
 	./cross-compile $(TAG)
 
-beta:	doc
+beta:
 	./cross-compile $(TAG)β
 	rm build/*-current-*
 	rclone -v copy build/ memstore:pub-rclone-org/$(TAG)β
@@ -68,7 +86,7 @@ serve:	website
 tag:	doc
 	@echo "Old tag is $(LAST_TAG)"
 	@echo "New tag is $(NEW_TAG)"
-	echo -e "package fs\n\n// Version of rclone\nconst Version = \"$(NEW_TAG)\"\n" | gofmt > fs/version.go
+	echo -e "package fs\n\n// Version of rclone\nvar Version = \"$(NEW_TAG)\"\n" | gofmt > fs/version.go
 	perl -lpe 's/VERSION/${NEW_TAG}/g; s/DATE/'`date -I`'/g;' docs/content/downloads.md.in > docs/content/downloads.md
 	git tag $(NEW_TAG)
 	@echo "Add this to changelog in docs/content/changelog.md"

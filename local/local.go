@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -15,14 +16,16 @@ import (
 	"unicode/utf8"
 
 	"github.com/ncw/rclone/fs"
+	"github.com/pkg/errors"
 )
 
 // Register with Fs
 func init() {
-	fsi := &fs.Info{
-		Name:  "local",
-		NewFs: NewFs,
-		Options: []fs.Option{fs.Option{
+	fsi := &fs.RegInfo{
+		Name:        "local",
+		Description: "Local Disk",
+		NewFs:       NewFs,
+		Options: []fs.Option{{
 			Name:     "nounc",
 			Help:     "Disable UNC (long path names) conversion on Windows",
 			Optional: true,
@@ -41,6 +44,7 @@ type Fs struct {
 	root        string              // The root directory
 	precisionOk sync.Once           // Whether we need to read the precision
 	precision   time.Duration       // precision of local filesystem
+	wmu         sync.Mutex          // used for locking access to 'warned'.
 	warned      map[string]struct{} // whether we have warned about this string
 	nounc       bool                // Skip UNC conversion on Windows
 }
@@ -48,8 +52,8 @@ type Fs struct {
 // Object represents a local filesystem object
 type Object struct {
 	fs     *Fs                    // The Fs this object is part of
-	remote string                 // The remote path
-	path   string                 // The local path
+	remote string                 // The remote path - properly UTF-8 encoded - for rclone
+	path   string                 // The local path - may not be properly UTF-8 encoded - for OS
 	info   os.FileInfo            // Interface for file info (always present)
 	hashes map[fs.HashType]string // Hashes
 }
@@ -66,17 +70,15 @@ func NewFs(name, root string) (fs.Fs, error) {
 		warned: make(map[string]struct{}),
 		nounc:  nounc == "true",
 	}
-	f.root = f.filterPath(f.cleanUtf8(root))
+	f.root = f.filterPath(root)
 
 	// Check to see if this points to a file
 	fi, err := os.Lstat(f.root)
 	if err == nil && fi.Mode().IsRegular() {
 		// It is a file, so use the parent as the root
-		var remote string
-		f.root, remote = getDirFile(f.root)
-		obj := f.NewFsObject(remote)
-		// return a Fs Limited to this object
-		return fs.NewLimited(f, obj), nil
+		f.root, _ = getDirFile(f.root)
+		// return an error with an fs which points to the parent
+		return f, fs.ErrorIsFile
 	}
 	return f, nil
 }
@@ -96,10 +98,11 @@ func (f *Fs) String() string {
 	return fmt.Sprintf("Local file system at %s", f.root)
 }
 
-// newFsObject makes a half completed Object
-func (f *Fs) newFsObject(remote string) *Object {
-	remote = filepath.ToSlash(remote)
-	dstPath := f.filterPath(filepath.Join(f.root, f.cleanUtf8(remote)))
+// newObject makes a half completed Object
+func (f *Fs) newObject(remote string) *Object {
+	remote = normString(remote)
+	dstPath := f.filterPath(filepath.Join(f.root, remote))
+	remote = filepath.ToSlash(f.cleanUtf8(remote))
 	return &Object{
 		fs:     f,
 		remote: remote,
@@ -107,66 +110,146 @@ func (f *Fs) newFsObject(remote string) *Object {
 	}
 }
 
-// Return an FsObject from a path
+// Return an Object from a path
 //
 // May return nil if an error occurred
-func (f *Fs) newFsObjectWithInfo(remote string, info os.FileInfo) fs.Object {
-	o := f.newFsObject(remote)
+func (f *Fs) newObjectWithInfo(remote string, info os.FileInfo) (fs.Object, error) {
+	o := f.newObject(remote)
 	if info != nil {
 		o.info = info
 	} else {
 		err := o.lstat()
 		if err != nil {
-			fs.Debug(o, "Failed to stat %s: %s", o.path, err)
-			return nil
+			if os.IsNotExist(err) {
+				return nil, fs.ErrorObjectNotFound
+			}
+			return nil, err
 		}
 	}
-	return o
+	return o, nil
 }
 
-// NewFsObject returns an FsObject from a path
-//
-// May return nil if an error occurred
-func (f *Fs) NewFsObject(remote string) fs.Object {
-	return f.newFsObjectWithInfo(remote, nil)
+// NewObject finds the Object at remote.  If it can't be found
+// it returns the error ErrorObjectNotFound.
+func (f *Fs) NewObject(remote string) (fs.Object, error) {
+	return f.newObjectWithInfo(remote, nil)
 }
 
-// List the path returning a channel of FsObjects
-//
-// Ignores everything which isn't Storable, eg links etc
-func (f *Fs) List() fs.ObjectsChan {
-	out := make(fs.ObjectsChan, fs.Config.Checkers)
-	go func() {
-		err := filepath.Walk(f.root, func(path string, fi os.FileInfo, err error) error {
-			if err != nil {
-				fs.Stats.Error()
-				fs.ErrorLog(f, "Failed to open directory: %s: %s", path, err)
-			} else {
-				remote, err := filepath.Rel(f.root, path)
-				if err != nil {
-					fs.Stats.Error()
-					fs.ErrorLog(f, "Failed to get relative path %s: %s", path, err)
-					return nil
-				}
-				if remote == "." {
-					return nil
-					// remote = ""
-				}
-				if fs := f.newFsObjectWithInfo(remote, fi); fs != nil {
-					if fs.Storable() {
-						out <- fs
+// listArgs is the arguments that a new list takes
+type listArgs struct {
+	remote  string
+	dirpath string
+	level   int
+}
+
+// list traverses the directory passed in, listing to out.
+// it returns a boolean whether it is finished or not.
+func (f *Fs) list(out fs.ListOpts, remote string, dirpath string, level int) (subdirs []listArgs) {
+	fd, err := os.Open(dirpath)
+	if err != nil {
+		out.SetError(errors.Wrapf(err, "failed to open directory %q", dirpath))
+		return nil
+	}
+	defer func() {
+		err := fd.Close()
+		if err != nil {
+			out.SetError(errors.Wrapf(err, "failed to close directory %q:", dirpath))
+		}
+	}()
+
+	for {
+		fis, err := fd.Readdir(1024)
+		if err == io.EOF && len(fis) == 0 {
+			break
+		}
+		if err != nil {
+			out.SetError(errors.Wrapf(err, "failed to read directory %q", dirpath))
+
+			return nil
+		}
+
+		for _, fi := range fis {
+			name := fi.Name()
+			newRemote := path.Join(remote, name)
+			newPath := filepath.Join(dirpath, name)
+			if fi.IsDir() {
+				if out.IncludeDirectory(newRemote) {
+					dir := &fs.Dir{
+						Name:  normString(f.cleanUtf8(newRemote)),
+						When:  fi.ModTime(),
+						Bytes: 0,
+						Count: 0,
+					}
+					if out.AddDir(dir) {
+						return nil
+					}
+					if level > 0 {
+						subdirs = append(subdirs, listArgs{remote: newRemote, dirpath: newPath, level: level - 1})
 					}
 				}
+			} else {
+				fso, err := f.newObjectWithInfo(newRemote, fi)
+				if err != nil {
+					out.SetError(err)
+					return nil
+				}
+				if fso.Storable() && out.Add(fso) {
+					return nil
+				}
 			}
-			return nil
-		})
-		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Failed to open directory: %s: %s", f.root, err)
 		}
-		close(out)
-	}()
-	return out
+	}
+	return subdirs
+}
+
+// List the path into out
+//
+// Ignores everything which isn't Storable, eg links etc
+func (f *Fs) List(out fs.ListOpts, dir string) {
+	defer out.Finished()
+	dir = filterFragment(f.cleanUtf8(dir))
+	root := filepath.Join(f.root, dir)
+	_, err := os.Stat(root)
+	if err != nil {
+		out.SetError(fs.ErrorDirNotFound)
+		return
+	}
+
+	in := make(chan listArgs, out.Buffer())
+	var wg sync.WaitGroup         // sync closing of go routines
+	var traversing sync.WaitGroup // running directory traversals
+
+	// Start the process
+	traversing.Add(1)
+	in <- listArgs{remote: dir, dirpath: root, level: out.Level() - 1}
+	for i := 0; i < fs.Config.Checkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range in {
+				if out.IsFinished() {
+					continue
+				}
+				newJobs := f.list(out, job.remote, job.dirpath, job.level)
+				// Now we have traversed this directory, send
+				// these ones off for traversal
+				if len(newJobs) != 0 {
+					traversing.Add(len(newJobs))
+					go func() {
+						for _, newJob := range newJobs {
+							in <- newJob
+						}
+					}()
+				}
+				traversing.Done()
+			}
+		}()
+	}
+
+	// Wait for traversal to finish
+	traversing.Wait()
+	close(in)
+	wg.Wait()
 }
 
 // CleanUtf8 makes string a valid UTF-8 string
@@ -174,10 +257,12 @@ func (f *Fs) List() fs.ObjectsChan {
 // Any invalid UTF-8 characters will be replaced with utf8.RuneError
 func (f *Fs) cleanUtf8(name string) string {
 	if !utf8.ValidString(name) {
+		f.wmu.Lock()
 		if _, ok := f.warned[name]; !ok {
 			fs.Debug(f, "Replacing invalid UTF-8 characters in %q", name)
 			f.warned[name] = struct{}{}
 		}
+		f.wmu.Unlock()
 		name = string([]rune(name))
 	}
 	if runtime.GOOS == "windows" {
@@ -186,54 +271,12 @@ func (f *Fs) cleanUtf8(name string) string {
 	return name
 }
 
-// ListDir walks the path returning a channel of FsObjects
-func (f *Fs) ListDir() fs.DirChan {
-	out := make(fs.DirChan, fs.Config.Checkers)
-	go func() {
-		defer close(out)
-		items, err := ioutil.ReadDir(f.root)
-		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't find read directory: %s", err)
-		} else {
-			for _, item := range items {
-				if item.IsDir() {
-					dir := &fs.Dir{
-						Name:  f.cleanUtf8(item.Name()),
-						When:  item.ModTime(),
-						Bytes: 0,
-						Count: 0,
-					}
-					// Go down the tree to count the files and directories
-					dirpath := f.filterPath(filepath.Join(f.root, item.Name()))
-					err := filepath.Walk(dirpath, func(path string, fi os.FileInfo, err error) error {
-						if err != nil {
-							fs.Stats.Error()
-							fs.ErrorLog(f, "Failed to open directory: %s: %s", path, err)
-						} else {
-							dir.Count++
-							dir.Bytes += fi.Size()
-						}
-						return nil
-					})
-					if err != nil {
-						fs.Stats.Error()
-						fs.ErrorLog(f, "Failed to open directory: %s: %s", dirpath, err)
-					}
-					out <- dir
-				}
-			}
-		}
-		// err := f.findRoot(false)
-	}()
-	return out
-}
-
-// Put the FsObject to the local filesystem
-func (f *Fs) Put(in io.Reader, remote string, modTime time.Time, size int64) (fs.Object, error) {
-	// Temporary FsObject under construction - info filled in by Update()
-	o := f.newFsObject(remote)
-	err := o.Update(in, modTime, size)
+// Put the Object to the local filesystem
+func (f *Fs) Put(in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
+	remote := src.Remote()
+	// Temporary Object under construction - info filled in by Update()
+	o := f.newObject(remote)
+	err := o.Update(in, src)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +367,7 @@ func (f *Fs) Purge() error {
 		return err
 	}
 	if !fi.Mode().IsDir() {
-		return fmt.Errorf("Can't Purge non directory: %q", f.root)
+		return errors.Errorf("can't purge non directory: %q", f.root)
 	}
 	return os.RemoveAll(f.root)
 }
@@ -345,8 +388,8 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 		return nil, fs.ErrorCantMove
 	}
 
-	// Temporary FsObject under construction
-	dstObj := f.newFsObject(remote)
+	// Temporary Object under construction
+	dstObj := f.newObject(remote)
 
 	// Check it is a file if it exists
 	err := dstObj.lstat()
@@ -356,7 +399,7 @@ func (f *Fs) Move(src fs.Object, remote string) (fs.Object, error) {
 		return nil, err
 	} else if !dstObj.info.Mode().IsRegular() {
 		// It isn't a file
-		return nil, fmt.Errorf("Can't move file onto non-file")
+		return nil, errors.New("can't move file onto non-file")
 	}
 
 	// Create destination
@@ -422,7 +465,7 @@ func (f *Fs) Hashes() fs.HashSet {
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
-func (o *Object) Fs() fs.Fs {
+func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
@@ -436,7 +479,7 @@ func (o *Object) String() string {
 
 // Remote returns the remote path
 func (o *Object) Remote() string {
-	return o.fs.cleanUtf8(o.remote)
+	return o.remote
 }
 
 // Hash returns the requested hash of a file as a lowercase hex string
@@ -446,9 +489,7 @@ func (o *Object) Hash(r fs.HashType) (string, error) {
 	oldsize := o.info.Size()
 	err := o.lstat()
 	if err != nil {
-		fs.Stats.Error()
-		fs.ErrorLog(o, "Failed to stat: %s", err)
-		return "", err
+		return "", errors.Wrap(err, "hash: failed to stat")
 	}
 
 	if !o.info.ModTime().Equal(oldtime) || oldsize != o.info.Size() {
@@ -459,21 +500,15 @@ func (o *Object) Hash(r fs.HashType) (string, error) {
 		o.hashes = make(map[fs.HashType]string)
 		in, err := os.Open(o.path)
 		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(o, "Failed to open: %s", err)
-			return "", err
+			return "", errors.Wrap(err, "hash: failed to open")
 		}
 		o.hashes, err = fs.HashStream(in)
 		closeErr := in.Close()
 		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(o, "Failed to read: %s", err)
-			return "", err
+			return "", errors.Wrap(err, "hash: failed to read")
 		}
 		if closeErr != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(o, "Failed to close: %s", closeErr)
-			return "", closeErr
+			return "", errors.Wrap(closeErr, "hash: failed to close")
 		}
 	}
 	return o.hashes[r], nil
@@ -490,18 +525,13 @@ func (o *Object) ModTime() time.Time {
 }
 
 // SetModTime sets the modification time of the local fs object
-func (o *Object) SetModTime(modTime time.Time) {
+func (o *Object) SetModTime(modTime time.Time) error {
 	err := os.Chtimes(o.path, modTime, modTime)
 	if err != nil {
-		fs.Debug(o, "Failed to set mtime on file: %s", err)
-		return
+		return err
 	}
 	// Re-read metadata
-	err = o.lstat()
-	if err != nil {
-		fs.Debug(o, "Failed to stat: %s", err)
-		return
-	}
+	return o.lstat()
 }
 
 // Storable returns a boolean showing if this object is storable
@@ -535,13 +565,13 @@ func (file *localOpenFile) Read(p []byte) (n int, err error) {
 	return
 }
 
-// Close the object and update the md5sum
+// Close the object and update the hashes
 func (file *localOpenFile) Close() (err error) {
 	err = file.in.Close()
 	if err == nil {
-		file.o.hashes = file.hash.Sums()
-	} else {
-		file.o.hashes = nil
+		if file.hash.Size() == file.o.Size() {
+			file.o.hashes = file.hash.Sums()
+		}
 	}
 	return err
 }
@@ -568,7 +598,7 @@ func (o *Object) mkdirAll() error {
 }
 
 // Update the object from in with modTime and size
-func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
+func (o *Object) Update(in io.Reader, src fs.ObjectInfo) error {
 	err := o.mkdirAll()
 	if err != nil {
 		return err
@@ -579,7 +609,7 @@ func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
 		return err
 	}
 
-	// Calculate the md5sum of the object we are reading as we go along
+	// Calculate the hash of the object we are reading as we go along
 	hash := fs.NewMultiHasher()
 	in = io.TeeReader(in, hash)
 
@@ -596,13 +626,16 @@ func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
 	o.hashes = hash.Sums()
 
 	// Set the mtime
-	o.SetModTime(modTime)
+	err = o.SetModTime(src.ModTime())
+	if err != nil {
+		return err
+	}
 
 	// ReRead info now that we have finished
 	return o.lstat()
 }
 
-// Stat a FsObject into info
+// Stat a Object into info
 func (o *Object) lstat() error {
 	info, err := os.Lstat(o.path)
 	o.info = info
@@ -618,14 +651,32 @@ func (o *Object) Remove() error {
 // Assumes os.PathSeparator is used.
 func getDirFile(s string) (string, string) {
 	i := strings.LastIndex(s, string(os.PathSeparator))
-	return s[:i], s[i+1:]
+	dir, file := s[:i], s[i+1:]
+	if dir == "" {
+		dir = string(os.PathSeparator)
+	}
+	return dir, file
 }
 
-func (f *Fs) filterPath(s string) string {
+// filterFragment cleans a path fragment which is part of a bigger
+// path and not necessarily absolute
+func filterFragment(s string) string {
+	if s == "" {
+		return s
+	}
 	s = filepath.Clean(s)
 	if runtime.GOOS == "windows" {
 		s = strings.Replace(s, `/`, `\`, -1)
+	}
+	return s
+}
 
+// filterPath cleans and makes absolute the path passed in.
+//
+// On windows it makes the path UNC also.
+func (f *Fs) filterPath(s string) string {
+	s = filterFragment(s)
+	if runtime.GOOS == "windows" {
 		if !filepath.IsAbs(s) && !strings.HasPrefix(s, "\\") {
 			s2, err := filepath.Abs(s)
 			if err == nil {
@@ -704,10 +755,12 @@ func cleanWindowsName(f *Fs, name string) string {
 	}, name)
 
 	if name2 != original && f != nil {
+		f.wmu.Lock()
 		if _, ok := f.warned[name]; !ok {
 			fs.Debug(f, "Replacing invalid characters in %q to %q", name, name2)
 			f.warned[name] = struct{}{}
 		}
+		f.wmu.Unlock()
 	}
 	return name2
 }

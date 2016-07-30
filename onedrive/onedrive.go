@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ncw/rclone/dircache"
@@ -19,17 +18,18 @@ import (
 	"github.com/ncw/rclone/onedrive/api"
 	"github.com/ncw/rclone/pacer"
 	"github.com/ncw/rclone/rest"
+	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/oauth2"
 )
 
 const (
-	rcloneClientID     = "0000000044165769"
-	rcloneClientSecret = "0+be4+jYw+7018HY6P3t/Izo+pTc+Yvt8+fy8NHU094="
-	minSleep           = 10 * time.Millisecond
-	maxSleep           = 2 * time.Second
-	decayConstant      = 2                               // bigger for slower decay, exponential
-	rootURL            = "https://api.onedrive.com/v1.0" // root URL for requests
+	rcloneClientID              = "0000000044165769"
+	rcloneEncryptedClientSecret = "0+be4+jYw+7018HY6P3t/Izo+pTc+Yvt8+fy8NHU094="
+	minSleep                    = 10 * time.Millisecond
+	maxSleep                    = 2 * time.Second
+	decayConstant               = 2                               // bigger for slower decay, exponential
+	rootURL                     = "https://api.onedrive.com/v1.0" // root URL for requests
 )
 
 // Globals
@@ -46,7 +46,7 @@ var (
 			TokenURL: "https://login.live.com/oauth20_token.srf",
 		},
 		ClientID:     rcloneClientID,
-		ClientSecret: fs.Reveal(rcloneClientSecret),
+		ClientSecret: fs.Reveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectPublicURL,
 	}
 	chunkSize    = fs.SizeSuffix(10 * 1024 * 1024)
@@ -55,9 +55,10 @@ var (
 
 // Register with Fs
 func init() {
-	fs.Register(&fs.Info{
-		Name:  "onedrive",
-		NewFs: NewFs,
+	fs.Register(&fs.RegInfo{
+		Name:        "onedrive",
+		Description: "Microsoft OneDrive",
+		NewFs:       NewFs,
 		Config: func(name string) {
 			err := oauthutil.Config("onedrive", name, oauthConfig)
 			if err != nil {
@@ -170,7 +171,7 @@ func errorHandler(resp *http.Response) error {
 // NewFs constructs an Fs from the path, container:path
 func NewFs(name, root string) (fs.Fs, error) {
 	root = parsePath(root)
-	oAuthClient, err := oauthutil.NewClient(name, oauthConfig)
+	oAuthClient, _, err := oauthutil.NewClient(name, oauthConfig)
 	if err != nil {
 		log.Fatalf("Failed to configure One Drive: %v", err)
 	}
@@ -186,7 +187,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 	// Get rootID
 	rootInfo, _, err := f.readMetaDataForPath("")
 	if err != nil || rootInfo.ID == "" {
-		return nil, fmt.Errorf("Failed to get root: %v", err)
+		return nil, errors.Wrap(err, "failed to get root")
 	}
 
 	f.dirCache = dircache.New(root, rootInfo.ID, f)
@@ -205,13 +206,16 @@ func NewFs(name, root string) (fs.Fs, error) {
 			// No root so return old f
 			return f, nil
 		}
-		obj := newF.newObjectWithInfo(remote, nil)
-		if obj == nil {
-			// File doesn't exist so return old f
-			return f, nil
+		_, err := newF.newObjectWithInfo(remote, nil)
+		if err != nil {
+			if err == fs.ErrorObjectNotFound {
+				// File doesn't exist so return old f
+				return f, nil
+			}
+			return nil, err
 		}
-		// return a Fs Limited to this object
-		return fs.NewLimited(&newF, obj), nil
+		// return an error with an fs which points to the parent
+		return &newF, fs.ErrorIsFile
 	}
 	return f, nil
 }
@@ -226,8 +230,8 @@ func (f *Fs) rootSlash() string {
 
 // Return an Object from a path
 //
-// May return nil if an error occurred
-func (f *Fs) newObjectWithInfo(remote string, info *api.Item) fs.Object {
+// If it can't be found it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) newObjectWithInfo(remote string, info *api.Item) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -238,17 +242,15 @@ func (f *Fs) newObjectWithInfo(remote string, info *api.Item) fs.Object {
 	} else {
 		err := o.readMetaData() // reads info and meta, returning an error
 		if err != nil {
-			// logged already FsDebug("Failed to read info: %s", err)
-			return nil
+			return nil, err
 		}
 	}
-	return o
+	return o, nil
 }
 
-// NewFsObject returns an Object from a path
-//
-// May return nil if an error occurred
-func (f *Fs) NewFsObject(remote string) fs.Object {
+// NewObject finds the Object at remote.  If it can't be found
+// it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) NewObject(remote string) (fs.Object, error) {
 	return f.newObjectWithInfo(remote, nil)
 }
 
@@ -257,7 +259,7 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 	// fs.Debug(f, "FindLeaf(%q, %q)", pathID, leaf)
 	parent, ok := f.dirCache.GetInv(pathID)
 	if !ok {
-		return "", false, fmt.Errorf("Couldn't find parent ID")
+		return "", false, errors.New("couldn't find parent ID")
 	}
 	path := leaf
 	if parent != "" {
@@ -274,7 +276,7 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 		return "", false, err
 	}
 	if info.Folder == nil {
-		return "", false, fmt.Errorf("Found file when looking for folder")
+		return "", false, errors.New("found file when looking for folder")
 	}
 	return info.ID, true, nil
 }
@@ -331,9 +333,7 @@ OUTER:
 			return shouldRetry(resp, err)
 		})
 		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't list files: %v", err)
-			break
+			return found, errors.Wrap(err, "couldn't list files")
 		}
 		if len(result.Value) == 0 {
 			break
@@ -368,98 +368,48 @@ OUTER:
 	return
 }
 
-// Path should be directory path either "" or "path/"
-//
-// List the directory using a recursive list from the root
-//
-// This fetches the minimum amount of stuff but does more API calls
-// which makes it slow
-func (f *Fs) listDirRecursive(dirID string, path string, out fs.ObjectsChan) error {
-	var subError error
-	// Make the API request
-	var wg sync.WaitGroup
-	_, err := f.listAll(dirID, false, false, func(info *api.Item) bool {
-		// Recurse on directories
+// ListDir reads the directory specified by the job into out, returning any more jobs
+func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.ListDirJob, err error) {
+	fs.Debug(f, "Reading %q", job.Path)
+	_, err = f.listAll(job.DirID, false, false, func(info *api.Item) bool {
+		remote := job.Path + info.Name
 		if info.Folder != nil {
-			wg.Add(1)
-			folder := path + info.Name + "/"
-			fs.Debug(f, "Reading %s", folder)
-			go func() {
-				defer wg.Done()
-				err := f.listDirRecursive(info.ID, folder, out)
-				if err != nil {
-					subError = err
-					fs.ErrorLog(f, "Error reading %s:%s", folder, err)
+			if out.IncludeDirectory(remote) {
+				dir := &fs.Dir{
+					Name:  remote,
+					Bytes: -1,
+					Count: -1,
+					When:  time.Time(info.LastModifiedDateTime),
 				}
-			}()
+				if info.Folder != nil {
+					dir.Count = info.Folder.ChildCount
+				}
+				if out.AddDir(dir) {
+					return true
+				}
+				if job.Depth > 0 {
+					jobs = append(jobs, dircache.ListDirJob{DirID: info.ID, Path: remote + "/", Depth: job.Depth - 1})
+				}
+			}
 		} else {
-			if fs := f.newObjectWithInfo(path+info.Name, info); fs != nil {
-				out <- fs
+			o, err := f.newObjectWithInfo(remote, info)
+			if err != nil {
+				out.SetError(err)
+				return true
+			}
+			if out.Add(o) {
+				return true
 			}
 		}
 		return false
 	})
-	wg.Wait()
-	fs.Debug(f, "Finished reading %s", path)
-	if err != nil {
-		return err
-	}
-	if subError != nil {
-		return subError
-	}
-	return nil
+	fs.Debug(f, "Finished reading %q", job.Path)
+	return jobs, err
 }
 
-// List walks the path returning a channel of Objects
-func (f *Fs) List() fs.ObjectsChan {
-	out := make(fs.ObjectsChan, fs.Config.Checkers)
-	go func() {
-		defer close(out)
-		err := f.dirCache.FindRoot(false)
-		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't find root: %s", err)
-		} else {
-			err = f.listDirRecursive(f.dirCache.RootID(), "", out)
-			if err != nil {
-				fs.Stats.Error()
-				fs.ErrorLog(f, "List failed: %s", err)
-			}
-		}
-	}()
-	return out
-}
-
-// ListDir lists the directories
-func (f *Fs) ListDir() fs.DirChan {
-	out := make(fs.DirChan, fs.Config.Checkers)
-	go func() {
-		defer close(out)
-		err := f.dirCache.FindRoot(false)
-		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't find root: %s", err)
-		} else {
-			_, err := f.listAll(f.dirCache.RootID(), true, false, func(item *api.Item) bool {
-				dir := &fs.Dir{
-					Name:  item.Name,
-					Bytes: -1,
-					Count: -1,
-					When:  time.Time(item.LastModifiedDateTime),
-				}
-				if item.Folder != nil {
-					dir.Count = item.Folder.ChildCount
-				}
-				out <- dir
-				return false
-			})
-			if err != nil {
-				fs.Stats.Error()
-				fs.ErrorLog(f, "ListDir failed: %s", err)
-			}
-		}
-	}()
-	return out
+// List walks the path returning files and directories into out
+func (f *Fs) List(out fs.ListOpts, dir string) {
+	f.dirCache.List(f, out, dir)
 }
 
 // Creates from the parameters passed in a half finished Object which
@@ -487,12 +437,16 @@ func (f *Fs) createObject(remote string, modTime time.Time, size int64) (o *Obje
 // Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
-func (f *Fs) Put(in io.Reader, remote string, modTime time.Time, size int64) (fs.Object, error) {
+func (f *Fs) Put(in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
+	remote := src.Remote()
+	size := src.Size()
+	modTime := src.ModTime()
+
 	o, _, _, err := f.createObject(remote, modTime, size)
 	if err != nil {
 		return nil, err
 	}
-	return o, o.Update(in, modTime, size)
+	return o, o.Update(in, src)
 }
 
 // Mkdir creates the container if it doesn't exist
@@ -517,7 +471,7 @@ func (f *Fs) deleteObject(id string) error {
 // refuses to do so if it has anything in
 func (f *Fs) purgeCheck(check bool) error {
 	if f.root == "" {
-		return fmt.Errorf("Can't purge root directory")
+		return errors.New("can't purge root directory")
 	}
 	dc := f.dirCache
 	err := dc.FindRoot(false)
@@ -530,10 +484,10 @@ func (f *Fs) purgeCheck(check bool) error {
 		return err
 	}
 	if item.Folder == nil {
-		return fmt.Errorf("Not a folder")
+		return errors.New("not a folder")
 	}
 	if check && item.Folder.ChildCount != 0 {
-		return fmt.Errorf("Folder not empty")
+		return errors.New("folder not empty")
 	}
 	err = f.deleteObject(rootID)
 	if err != nil {
@@ -583,7 +537,7 @@ func (f *Fs) waitForJob(location string, o *Object) error {
 				return err
 			}
 			if status.Status == "failed" || status.Status == "deleteFailed" {
-				return fmt.Errorf("Async operation %q returned %q", status.Operation, status.Status)
+				return errors.Errorf("async operation %q returned %q", status.Operation, status.Status)
 			}
 		} else {
 			var info api.Item
@@ -596,7 +550,7 @@ func (f *Fs) waitForJob(location string, o *Object) error {
 		}
 		time.Sleep(1 * time.Second)
 	}
-	return fmt.Errorf("Async operation didn't complete after %v", fs.Config.Timeout)
+	return errors.Errorf("async operation didn't complete after %v", fs.Config.Timeout)
 }
 
 // Copy src to this remote using server side copy operations.
@@ -651,7 +605,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	// read location header
 	location := resp.Header.Get("Location")
 	if location == "" {
-		return nil, fmt.Errorf("Didn't receive location header in copy response")
+		return nil, errors.New("didn't receive location header in copy response")
 	}
 
 	// Wait for job to finish
@@ -679,7 +633,7 @@ func (f *Fs) Hashes() fs.HashSet {
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
-func (o *Object) Fs() fs.Fs {
+func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
@@ -713,7 +667,7 @@ func (o *Object) Hash(t fs.HashType) (string, error) {
 func (o *Object) Size() int64 {
 	err := o.readMetaData()
 	if err != nil {
-		fs.Log(o, "Failed to read metadata: %s", err)
+		fs.Log(o, "Failed to read metadata: %v", err)
 		return 0
 	}
 	return o.size
@@ -755,7 +709,11 @@ func (o *Object) readMetaData() (err error) {
 	// }
 	info, _, err := o.fs.readMetaDataForPath(o.srvPath())
 	if err != nil {
-		fs.Debug(o, "Failed to read info: %s", err)
+		if apiErr, ok := err.(*api.Error); ok {
+			if apiErr.ErrorInfo.Code == "itemNotFound" {
+				return fs.ErrorObjectNotFound
+			}
+		}
 		return err
 	}
 	o.setMetaData(info)
@@ -770,7 +728,7 @@ func (o *Object) readMetaData() (err error) {
 func (o *Object) ModTime() time.Time {
 	err := o.readMetaData()
 	if err != nil {
-		fs.Log(o, "Failed to read metadata: %s", err)
+		fs.Log(o, "Failed to read metadata: %v", err)
 		return time.Now()
 	}
 	return o.modTime
@@ -797,13 +755,13 @@ func (o *Object) setModTime(modTime time.Time) (*api.Item, error) {
 }
 
 // SetModTime sets the modification time of the local fs object
-func (o *Object) SetModTime(modTime time.Time) {
+func (o *Object) SetModTime(modTime time.Time) error {
 	info, err := o.setModTime(modTime)
 	if err != nil {
-		fs.Stats.Error()
-		fs.ErrorLog(o, "Failed to update remote mtime: %v", err)
+		return err
 	}
 	o.setMetaData(info)
+	return nil
 }
 
 // Storable returns a boolean showing whether this object storable
@@ -814,7 +772,7 @@ func (o *Object) Storable() bool {
 // Open an object for read
 func (o *Object) Open() (in io.ReadCloser, err error) {
 	if o.id == "" {
-		return nil, fmt.Errorf("Can't download no id")
+		return nil, errors.New("can't download - no id")
 	}
 	var resp *http.Response
 	opts := rest.Opts{
@@ -884,7 +842,7 @@ func (o *Object) cancelUploadSession(url string) (err error) {
 // uploadMultipart uploads a file using multipart upload
 func (o *Object) uploadMultipart(in io.Reader, size int64) (err error) {
 	if chunkSize%(320*1024) != 0 {
-		return fmt.Errorf("Chunk size %d is not a multiple of 320k", chunkSize)
+		return errors.Errorf("chunk size %d is not a multiple of 320k", chunkSize)
 	}
 
 	// Create upload session
@@ -935,7 +893,10 @@ func (o *Object) uploadMultipart(in io.Reader, size int64) (err error) {
 // Update the object with the contents of the io.Reader, modTime and size
 //
 // The new object may have been created if an error is returned
-func (o *Object) Update(in io.Reader, modTime time.Time, size int64) (err error) {
+func (o *Object) Update(in io.Reader, src fs.ObjectInfo) (err error) {
+	size := src.Size()
+	modTime := src.ModTime()
+
 	var info *api.Item
 	if size <= int64(uploadCutoff) {
 		// This is for less than 100 MB of content

@@ -5,6 +5,8 @@ package fstest
 
 import (
 	"bytes"
+	"flag"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -17,11 +19,14 @@ import (
 	"time"
 
 	"github.com/ncw/rclone/fs"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
 	// MatchTestRemote matches the remote names used for testing
 	MatchTestRemote = regexp.MustCompile(`^rclone-test-[abcdefghijklmnopqrstuvwxyz0123456789]{24}$`)
+	listRetries     = flag.Int("list-retries", 6, "Number or times to retry listing")
 )
 
 // Seed the random number generator
@@ -69,35 +74,25 @@ func CheckTimeEqualWithPrecision(t0, t1 time.Time, precision time.Duration) (tim
 // CheckModTime checks the mod time to the given precision
 func (i *Item) CheckModTime(t *testing.T, obj fs.Object, modTime time.Time, precision time.Duration) {
 	dt, ok := CheckTimeEqualWithPrecision(modTime, i.ModTime, precision)
-	if !ok {
-		t.Errorf("%s: Modification time difference too big |%s| > %s (%s vs %s) (precision %s)", obj.Remote(), dt, precision, modTime, i.ModTime, precision)
-	}
+	assert.True(t, ok, fmt.Sprintf("%s: Modification time difference too big |%s| > %s (%s vs %s) (precision %s)", obj.Remote(), dt, precision, modTime, i.ModTime, precision))
 }
 
 // CheckHashes checks all the hashes the object supports are correct
 func (i *Item) CheckHashes(t *testing.T, obj fs.Object) {
-	if obj == nil {
-		t.Fatalf("Object is nil")
-	}
+	require.NotNil(t, obj)
 	types := obj.Fs().Hashes().Array()
 	for _, hash := range types {
 		// Check attributes
 		sum, err := obj.Hash(hash)
-		if err != nil {
-			t.Fatalf("%s: Failed to read hash %v for %q: %v", obj.Fs().String(), hash, obj.Remote(), err)
-		}
-		if !fs.HashEquals(i.Hashes[hash], sum) {
-			t.Errorf("%s/%s: %v hash incorrect - expecting %q got %q", obj.Fs().String(), obj.Remote(), hash, i.Hashes[hash], sum)
-		}
+		require.NoError(t, err)
+		assert.True(t, fs.HashEquals(i.Hashes[hash], sum), fmt.Sprintf("%s/%s: %v hash incorrect - expecting %q got %q", obj.Fs().String(), obj.Remote(), hash, i.Hashes[hash], sum))
 	}
 }
 
 // Check checks all the attributes of the object are correct
 func (i *Item) Check(t *testing.T, obj fs.Object, precision time.Duration) {
 	i.CheckHashes(t, obj)
-	if i.Size != obj.Size() {
-		t.Errorf("%s/%s: Size incorrect - expecting %d got %d", obj.Fs().String(), obj.Remote(), i.Size, obj.Size())
-	}
+	assert.Equal(t, i.Size, obj.Size())
 	i.CheckModTime(t, obj, obj.ModTime(), precision)
 }
 
@@ -128,14 +123,13 @@ func (is *Items) Find(t *testing.T, obj fs.Object, precision time.Duration) {
 	i, ok := is.byName[obj.Remote()]
 	if !ok {
 		i, ok = is.byNameAlt[obj.Remote()]
-		if !ok {
-			t.Errorf("Unexpected file %q", obj.Remote())
-			return
-		}
+		assert.True(t, ok, fmt.Sprintf("Unexpected file %q", obj.Remote()))
 	}
-	delete(is.byName, i.Path)
-	delete(is.byName, i.WinPath)
-	i.Check(t, obj, precision)
+	if i != nil {
+		delete(is.byName, i.Path)
+		delete(is.byName, i.WinPath)
+		i.Check(t, obj, precision)
+	}
 }
 
 // Done checks all finished
@@ -144,8 +138,8 @@ func (is *Items) Done(t *testing.T) {
 		for name := range is.byName {
 			t.Logf("Not found %q", name)
 		}
-		t.Errorf("%d objects not found", len(is.byName))
 	}
+	assert.Equal(t, 0, len(is.byName), fmt.Sprintf("%d objects not found", len(is.byName)))
 }
 
 // CheckListingWithPrecision checks the fs to see if it has the
@@ -154,16 +148,17 @@ func CheckListingWithPrecision(t *testing.T, f fs.Fs, items []Item, precision ti
 	is := NewItems(items)
 	oldErrors := fs.Stats.GetErrors()
 	var objs []fs.Object
-	const retries = 6
+	var err error
+	var retries = *listRetries
 	sleep := time.Second / 2
 	for i := 1; i <= retries; i++ {
-		objs = nil
-		for obj := range f.List() {
-			objs = append(objs, obj)
+		objs, err = fs.NewLister().Start(f, "").GetObjects()
+		if err != nil && err != fs.ErrorDirNotFound {
+			t.Fatalf("Error listing: %v", err)
 		}
 		if len(objs) == len(items) {
 			// Put an extra sleep in if we did any retries just to make sure it really
-			// is consistent (here is looking at you Amazon Cloud Drive!)
+			// is consistent (here is looking at you Amazon Drive!)
 			if i != 1 {
 				extraSleep := 5*time.Second + sleep
 				t.Logf("Sleeping for %v just to make sure", extraSleep)
@@ -176,10 +171,7 @@ func CheckListingWithPrecision(t *testing.T, f fs.Fs, items []Item, precision ti
 		time.Sleep(sleep)
 	}
 	for _, obj := range objs {
-		if obj == nil {
-			t.Errorf("Unexpected nil in List()")
-			continue
-		}
+		require.NotNil(t, obj)
 		is.Find(t, obj, precision)
 	}
 	is.Done(t)
@@ -269,26 +261,28 @@ func RandomRemoteName(remoteName string) (string, string, error) {
 //
 // Call the finalise function returned to Purge the fs at the end (and
 // the parent if necessary)
-func RandomRemote(remoteName string, subdir bool) (fs.Fs, func(), error) {
+//
+// Returns the remote, its url, a finaliser and an error
+func RandomRemote(remoteName string, subdir bool) (fs.Fs, string, func(), error) {
 	var err error
 	var parentRemote fs.Fs
 
 	remoteName, _, err = RandomRemoteName(remoteName)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
 	if subdir {
 		parentRemote, err = fs.NewFs(remoteName)
 		if err != nil {
-			return nil, nil, err
+			return nil, "", nil, err
 		}
 		remoteName += "/rclone-test-subdir-" + RandomString(8)
 	}
 
 	remote, err := fs.NewFs(remoteName)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
 	finalise := func() {
@@ -301,31 +295,25 @@ func RandomRemote(remoteName string, subdir bool) (fs.Fs, func(), error) {
 		}
 	}
 
-	return remote, finalise, nil
+	return remote, remoteName, finalise, nil
 }
 
 // TestMkdir tests Mkdir works
 func TestMkdir(t *testing.T, remote fs.Fs) {
 	err := fs.Mkdir(remote)
-	if err != nil {
-		t.Fatalf("Mkdir failed: %v", err)
-	}
+	require.NoError(t, err)
 	CheckListing(t, remote, []Item{})
 }
 
 // TestPurge tests Purge works
 func TestPurge(t *testing.T, remote fs.Fs) {
 	err := fs.Purge(remote)
-	if err != nil {
-		t.Fatalf("Purge failed: %v", err)
-	}
+	require.NoError(t, err)
 	CheckListing(t, remote, []Item{})
 }
 
 // TestRmdir tests Rmdir works
 func TestRmdir(t *testing.T, remote fs.Fs) {
 	err := fs.Rmdir(remote)
-	if err != nil {
-		t.Fatalf("Rmdir failed: %v", err)
-	}
+	require.NoError(t, err)
 }

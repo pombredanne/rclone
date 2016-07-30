@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"runtime"
 	"runtime/pprof"
 	"strings"
@@ -171,7 +172,7 @@ var Commands = []Command{
 				return err
 			}
 			fmt.Printf("Total objects: %d\n", objects)
-			fmt.Printf("Total size: %v (%d bytes)\n", fs.SizeSuffix(size), size)
+			fmt.Printf("Total size: %s (%d Bytes)\n", fs.SizeSuffix(size).Unit("Bytes"), size)
 			return nil
 		},
 		MinArgs: 1,
@@ -248,7 +249,7 @@ var Commands = []Command{
         but one or rename them to be different. Only useful with
         Google Drive which can have duplicate file names.`,
 		Run: func(fdst, fsrc fs.Fs) error {
-			return fs.Deduplicate(fdst)
+			return fs.Deduplicate(fdst, fs.Config.DedupeMode)
 		},
 		MinArgs: 1,
 		MaxArgs: 1,
@@ -276,6 +277,19 @@ var Commands = []Command{
 		NoStats: true,
 		MinArgs: 1,
 		MaxArgs: 3,
+	},
+	{
+		Name:     "cleanup",
+		ArgsHelp: "remote:path",
+		Help: `
+        Clean up the remote if possible.  Empty the trash or delete
+        old file versions. Not supported by all remotes.`,
+		Run: func(fdst, fsrc fs.Fs) error {
+			return fs.CleanUp(fdst)
+		},
+		MinArgs: 1,
+		MaxArgs: 1,
+		Retry:   true,
 	},
 	{
 		Name: "help",
@@ -320,7 +334,6 @@ func ParseFlags() {
 	pflag.Usage = syntaxError
 	pflag.Parse()
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	fs.LoadConfig()
 }
 
 // ParseCommand parses the command from the command line
@@ -369,7 +382,32 @@ func ParseCommand() (*Command, []string) {
 	return command, args
 }
 
-// NewFs creates a Fs from a name
+// NewFsSrc creates a src Fs from a name
+func NewFsSrc(remote string) fs.Fs {
+	fsInfo, configName, fsPath, err := fs.ParseRemote(remote)
+	if err != nil {
+		fs.Stats.Error()
+		log.Fatalf("Failed to create file system for %q: %v", remote, err)
+	}
+	f, err := fsInfo.NewFs(configName, fsPath)
+	if err == fs.ErrorIsFile {
+		if !fs.Config.Filter.InActive() {
+			fs.Stats.Error()
+			log.Fatalf("Can't limit to single files when using filters: %v", remote)
+		}
+		// Limit transfers to this file
+		err = fs.Config.Filter.AddFile(path.Base(fsPath))
+		// Set --no-traverse as only one file
+		fs.Config.NoTraverse = true
+	}
+	if err != nil {
+		fs.Stats.Error()
+		log.Fatalf("Failed to create file system for %q: %v", remote, err)
+	}
+	return f
+}
+
+// NewFs creates a dst Fs from a name
 func NewFs(remote string) fs.Fs {
 	f, err := fs.NewFs(remote)
 	if err != nil {
@@ -409,15 +447,22 @@ func main() {
 		}
 		_, err = f.Seek(0, os.SEEK_END)
 		if err != nil {
-			log.Printf("Failed to seek log file to end: %v", err)
+			fs.ErrorLog(nil, "Failed to seek log file to end: %v", err)
 		}
 		log.SetOutput(f)
+		fs.DebugLogger.SetOutput(f)
 		redirectStderr(f)
 	}
 
+	// Load the rest of the config now we have started the logger
+	fs.LoadConfig()
+
+	// Write the args for debug purposes
+	fs.Debug("rclone", "Version %q starting with parameters %q", fs.Version, os.Args)
+
 	// Setup CPU profiling if desired
 	if *cpuProfile != "" {
-		log.Printf("Creating CPU profile %q\n", *cpuProfile)
+		fs.Log(nil, "Creating CPU profile %q\n", *cpuProfile)
 		f, err := os.Create(*cpuProfile)
 		if err != nil {
 			fs.Stats.Error()
@@ -434,7 +479,7 @@ func main() {
 	// Setup memory profiling if desired
 	if *memProfile != "" {
 		defer func() {
-			log.Printf("Saving Memory profile %q\n", *memProfile)
+			fs.Log(nil, "Saving Memory profile %q\n", *memProfile)
 			f, err := os.Create(*memProfile)
 			if err != nil {
 				fs.Stats.Error()
@@ -456,7 +501,7 @@ func main() {
 	// Make source and destination fs
 	var fdst, fsrc fs.Fs
 	if len(args) >= 1 {
-		fdst = NewFs(args[0])
+		fdst = NewFsSrc(args[0])
 	}
 	if len(args) >= 2 {
 		fsrc = fdst
@@ -481,6 +526,14 @@ func main() {
 		if !command.Retry || (err == nil && !fs.Stats.Errored()) {
 			break
 		}
+		if fs.IsFatalError(err) {
+			fs.Log(nil, "Fatal error received - not attempting retries")
+			break
+		}
+		if fs.IsNoRetryError(err) {
+			fs.Log(nil, "Can't retry this error - not attempting retries")
+			break
+		}
 		if err != nil {
 			fs.Log(nil, "Attempt %d/%d failed with %d errors and: %v", try, *retries, fs.Stats.GetErrors(), err)
 		} else {
@@ -494,7 +547,7 @@ func main() {
 		log.Fatalf("Failed to %s: %v", command.Name, err)
 	}
 	if !command.NoStats && (!fs.Config.Quiet || fs.Stats.Errored() || *statsInterval > 0) {
-		fmt.Fprintln(os.Stderr, fs.Stats)
+		fs.Log(nil, "%s", fs.Stats)
 	}
 	if fs.Config.Verbose {
 		fs.Debug(nil, "Go routines at exit %d\n", runtime.NumGoroutine())

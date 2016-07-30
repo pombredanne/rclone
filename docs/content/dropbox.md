@@ -1,7 +1,7 @@
 ---
 title: "Dropbox"
 description: "Rclone docs for Dropbox"
-date: "2014-07-17"
+date: "2016-02-21"
 ---
 
 <i class="fa fa-dropbox"></i> Dropbox
@@ -28,15 +28,31 @@ d) Delete remote
 q) Quit config
 e/n/d/q> n
 name> remote
-What type of source is it?
-Choose a number from below
- 1) swift
- 2) s3
- 3) local
- 4) google cloud storage
- 5) dropbox
- 6) drive
-type> 5
+Type of storage to configure.
+Choose a number from below, or type in your own value
+ 1 / Amazon Drive
+   \ "amazon cloud drive"
+ 2 / Amazon S3 (also Dreamhost, Ceph)
+   \ "s3"
+ 3 / Backblaze B2
+   \ "b2"
+ 4 / Dropbox
+   \ "dropbox"
+ 5 / Google Cloud Storage (this is not Google Drive)
+   \ "google cloud storage"
+ 6 / Google Drive
+   \ "drive"
+ 7 / Hubic
+   \ "hubic"
+ 8 / Local Disk
+   \ "local"
+ 9 / Microsoft OneDrive
+   \ "onedrive"
+10 / Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)
+   \ "swift"
+11 / Yandex Disk
+   \ "yandex"
+Storage> 4
 Dropbox App Key - leave blank normally.
 app_key> 
 Dropbox App Secret - leave blank normally.
@@ -73,8 +89,18 @@ To copy a local directory to a dropbox directory called backup
 
 ### Modified time and MD5SUMs ###
 
-Dropbox doesn't have the capability of storing modification times or
-MD5SUMs so syncs will effectively have the `--size-only` flag set.
+Dropbox doesn't provide the ability to set modification times in the
+V1 public API, so rclone can't support modified time with Dropbox.
+
+This may change in the future - see these issues for details:
+
+  * [Dropbox V2 API](https://github.com/ncw/rclone/issues/349)
+  * [Allow syncs for remotes that can't set modtime on existing objects](https://github.com/ncw/rclone/issues/348)
+
+Dropbox doesn't return any sort of checksum (MD5 or SHA1).
+
+Together that means that syncs to dropbox will effectively have the
+`--size-only` flag set.
 
 ### Specific options ###
 
@@ -96,3 +122,8 @@ store.  There is a full list of them in the ["Ignored Files" section
 of this document](https://www.dropbox.com/en/help/145).  Rclone will
 issue an error message `File name disallowed - not uploading` if it
 attempt to upload one of those file names, but the sync won't fail.
+
+If you have more than 10,000 files in a directory then `rclone purge
+dropbox:dir` will return the error `Failed to purge: There are too
+many files involved in this operation`.  As a work-around do an
+`rclone delete dropbix:dir` followed by an `rclone rmdir dropbox:dir`.

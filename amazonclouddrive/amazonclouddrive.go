@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ncw/go-acd"
@@ -27,20 +26,21 @@ import (
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/oauthutil"
 	"github.com/ncw/rclone/pacer"
+	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 	"golang.org/x/oauth2"
 )
 
 const (
-	rcloneClientID     = "amzn1.application-oa2-client.6bf18d2d1f5b485c94c8988bb03ad0e7"
-	rcloneClientSecret = "k8/NyszKm5vEkZXAwsbGkd6C3NrbjIqMg4qEhIeF14Szub2wur+/teS3ubXgsLe9//+tr/qoqK+lq6mg8vWkoA=="
-	folderKind         = "FOLDER"
-	fileKind           = "FILE"
-	assetKind          = "ASSET"
-	statusAvailable    = "AVAILABLE"
-	timeFormat         = time.RFC3339 // 2014-03-07T22:31:12.173Z
-	minSleep           = 20 * time.Millisecond
-	warnFileSize       = 50 << 30 // Display warning for files larger than this size
+	rcloneClientID              = "amzn1.application-oa2-client.6bf18d2d1f5b485c94c8988bb03ad0e7"
+	rcloneEncryptedClientSecret = "k8/NyszKm5vEkZXAwsbGkd6C3NrbjIqMg4qEhIeF14Szub2wur+/teS3ubXgsLe9//+tr/qoqK+lq6mg8vWkoA=="
+	folderKind                  = "FOLDER"
+	fileKind                    = "FILE"
+	assetKind                   = "ASSET"
+	statusAvailable             = "AVAILABLE"
+	timeFormat                  = time.RFC3339 // 2014-03-07T22:31:12.173Z
+	minSleep                    = 20 * time.Millisecond
+	warnFileSize                = 50 << 30 // Display warning for files larger than this size
 )
 
 // Globals
@@ -55,16 +55,17 @@ var (
 			TokenURL: "https://api.amazon.com/auth/o2/token",
 		},
 		ClientID:     rcloneClientID,
-		ClientSecret: fs.Reveal(rcloneClientSecret),
+		ClientSecret: fs.Reveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectURL,
 	}
 )
 
 // Register with Fs
 func init() {
-	fs.Register(&fs.Info{
-		Name:  "amazon cloud drive",
-		NewFs: NewFs,
+	fs.Register(&fs.RegInfo{
+		Name:        "amazon cloud drive",
+		Description: "Amazon Drive",
+		NewFs:       NewFs,
 		Config: func(name string) {
 			err := oauthutil.Config("amazon cloud drive", name, acdConfig)
 			if err != nil {
@@ -84,12 +85,13 @@ func init() {
 
 // Fs represents a remote acd server
 type Fs struct {
-	name         string             // name of this remote
-	c            *acd.Client        // the connection to the acd server
-	noAuthClient *http.Client       // unauthenticated http client
-	root         string             // the path we are working on
-	dirCache     *dircache.DirCache // Map of directory path to directory id
-	pacer        *pacer.Pacer       // pacer for API calls
+	name         string                 // name of this remote
+	c            *acd.Client            // the connection to the acd server
+	noAuthClient *http.Client           // unauthenticated http client
+	root         string                 // the path we are working on
+	dirCache     *dircache.DirCache     // Map of directory path to directory id
+	pacer        *pacer.Pacer           // pacer for API calls
+	ts           *oauthutil.TokenSource // token source for oauth
 }
 
 // Object describes a acd object
@@ -115,7 +117,7 @@ func (f *Fs) Root() string {
 
 // String converts this Fs to a string
 func (f *Fs) String() string {
-	return fmt.Sprintf("Amazon cloud drive root '%s'", f.root)
+	return fmt.Sprintf("amazon drive root '%s'", f.root)
 }
 
 // Pattern to match a acd path
@@ -129,23 +131,41 @@ func parsePath(path string) (root string) {
 
 // retryErrorCodes is a slice of error codes that we will retry
 var retryErrorCodes = []int{
+	400, // Bad request (seen in "Next token is expired")
+	401, // Unauthorized (seen in "Token has expired")
+	408, // Request Timeout
 	429, // Rate exceeded.
 	500, // Get occasional 500 Internal Server Error
 	503, // Service Unavailable
+	504, // Gateway Time-out
 }
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(resp *http.Response, err error) (bool, error) {
+func (f *Fs) shouldRetry(resp *http.Response, err error) (bool, error) {
+	if resp != nil {
+		if resp.StatusCode == 401 {
+			f.ts.Invalidate()
+			fs.Log(f, "401 error received - invalidating token")
+			return true, err
+		}
+		// Work around receiving this error sporadically on authentication
+		//
+		// HTTP code 403: "403 Forbidden", reponse body: {"message":"Authorization header requires 'Credential' parameter. Authorization header requires 'Signature' parameter. Authorization header requires 'SignedHeaders' parameter. Authorization header requires existence of either a 'X-Amz-Date' or a 'Date' header. Authorization=Bearer"}
+		if resp.StatusCode == 403 && strings.Contains(err.Error(), "Authorization header requires") {
+			fs.Log(f, "403 \"Authorization header requires...\" error received - retry")
+			return true, err
+		}
+	}
 	return fs.ShouldRetry(err) || fs.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
 // NewFs constructs an Fs from the path, container:path
 func NewFs(name, root string) (fs.Fs, error) {
 	root = parsePath(root)
-	oAuthClient, err := oauthutil.NewClient(name, acdConfig)
+	oAuthClient, ts, err := oauthutil.NewClient(name, acdConfig)
 	if err != nil {
-		log.Fatalf("Failed to configure amazon cloud drive: %v", err)
+		log.Fatalf("Failed to configure Amazon Drive: %v", err)
 	}
 
 	c := acd.NewClient(oAuthClient)
@@ -156,26 +176,27 @@ func NewFs(name, root string) (fs.Fs, error) {
 		c:            c,
 		pacer:        pacer.New().SetMinSleep(minSleep).SetPacer(pacer.AmazonCloudDrivePacer),
 		noAuthClient: fs.Config.Client(),
+		ts:           ts,
 	}
 
 	// Update endpoints
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		_, resp, err = f.c.Account.GetEndpoints()
-		return shouldRetry(resp, err)
+		return f.shouldRetry(resp, err)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Failed to get endpoints: %v", err)
+		return nil, errors.Wrap(err, "failed to get endpoints")
 	}
 
 	// Get rootID
 	var rootInfo *acd.Folder
 	err = f.pacer.Call(func() (bool, error) {
 		rootInfo, resp, err = f.c.Nodes.GetRoot()
-		return shouldRetry(resp, err)
+		return f.shouldRetry(resp, err)
 	})
 	if err != nil || rootInfo.Id == nil {
-		return nil, fmt.Errorf("Failed to get root: %v", err)
+		return nil, errors.Wrap(err, "failed to get root")
 	}
 
 	f.dirCache = dircache.New(root, *rootInfo.Id, f)
@@ -194,21 +215,24 @@ func NewFs(name, root string) (fs.Fs, error) {
 			// No root so return old f
 			return f, nil
 		}
-		obj := newF.newFsObjectWithInfo(remote, nil)
-		if obj == nil {
-			// File doesn't exist so return old f
-			return f, nil
+		_, err := newF.newObjectWithInfo(remote, nil)
+		if err != nil {
+			if err == fs.ErrorObjectNotFound {
+				// File doesn't exist so return old f
+				return f, nil
+			}
+			return nil, err
 		}
-		// return a Fs Limited to this object
-		return fs.NewLimited(&newF, obj), nil
+		// return an error with an fs which points to the parent
+		return &newF, fs.ErrorIsFile
 	}
 	return f, nil
 }
 
-// Return an FsObject from a path
+// Return an Object from a path
 //
-// May return nil if an error occurred
-func (f *Fs) newFsObjectWithInfo(remote string, info *acd.Node) fs.Object {
+// If it can't be found it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) newObjectWithInfo(remote string, info *acd.Node) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -219,18 +243,16 @@ func (f *Fs) newFsObjectWithInfo(remote string, info *acd.Node) fs.Object {
 	} else {
 		err := o.readMetaData() // reads info and meta, returning an error
 		if err != nil {
-			// logged already FsDebug("Failed to read info: %s", err)
-			return nil
+			return nil, err
 		}
 	}
-	return o
+	return o, nil
 }
 
-// NewFsObject returns an FsObject from a path
-//
-// May return nil if an error occurred
-func (f *Fs) NewFsObject(remote string) fs.Object {
-	return f.newFsObjectWithInfo(remote, nil)
+// NewObject finds the Object at remote.  If it can't be found
+// it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) NewObject(remote string) (fs.Object, error) {
+	return f.newObjectWithInfo(remote, nil)
 }
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
@@ -241,7 +263,7 @@ func (f *Fs) FindLeaf(pathID, leaf string) (pathIDOut string, found bool, err er
 	var subFolder *acd.Folder
 	err = f.pacer.Call(func() (bool, error) {
 		subFolder, resp, err = folder.GetFolder(leaf)
-		return shouldRetry(resp, err)
+		return f.shouldRetry(resp, err)
 	})
 	if err != nil {
 		if err == acd.ErrorNodeNotFound {
@@ -268,7 +290,7 @@ func (f *Fs) CreateDir(pathID, leaf string) (newID string, err error) {
 	var info *acd.Folder
 	err = f.pacer.Call(func() (bool, error) {
 		info, resp, err = folder.CreateFolder(leaf)
-		return shouldRetry(resp, err)
+		return f.shouldRetry(resp, err)
 	})
 	if err != nil {
 		//fmt.Printf("...Error %v\n", err)
@@ -304,18 +326,16 @@ func (f *Fs) listAll(dirID string, title string, directoriesOnly bool, filesOnly
 		Filters: query,
 	}
 	var nodes []*acd.Node
+	var out []*acd.Node
 	//var resp *http.Response
-OUTER:
 	for {
 		var resp *http.Response
-		err = f.pacer.Call(func() (bool, error) {
+		err = f.pacer.CallNoRetry(func() (bool, error) {
 			nodes, resp, err = f.c.Nodes.GetNodes(&opts)
-			return shouldRetry(resp, err)
+			return f.shouldRetry(resp, err)
 		})
 		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't list files: %v", err)
-			break
+			return false, err
 		}
 		if nodes == nil {
 			break
@@ -326,187 +346,74 @@ OUTER:
 				if *node.Status != statusAvailable {
 					continue
 				}
-				if fn(node) {
-					found = true
-					break OUTER
-				}
+				// Store the nodes up in case we have to retry the listing
+				out = append(out, node)
 			}
+		}
+	}
+	// Send the nodes now
+	for _, node := range out {
+		if fn(node) {
+			found = true
+			break
 		}
 	}
 	return
 }
 
-// Path should be directory path either "" or "path/"
-//
-// List the directory using a recursive list from the root
-//
-// This fetches the minimum amount of stuff but does more API calls
-// which makes it slow
-func (f *Fs) listDirRecursive(dirID string, path string, out fs.ObjectsChan) error {
-	var subError error
-	// Make the API request
-	var wg sync.WaitGroup
-	_, err := f.listAll(dirID, "", false, false, func(node *acd.Node) bool {
-		// Recurse on directories
-		switch *node.Kind {
-		case folderKind:
-			wg.Add(1)
-			folder := path + *node.Name + "/"
-			fs.Debug(f, "Reading %s", folder)
-			go func() {
-				defer wg.Done()
-				err := f.listDirRecursive(*node.Id, folder, out)
-				if err != nil {
-					subError = err
-					fs.ErrorLog(f, "Error reading %s:%s", folder, err)
+// ListDir reads the directory specified by the job into out, returning any more jobs
+func (f *Fs) ListDir(out fs.ListOpts, job dircache.ListDirJob) (jobs []dircache.ListDirJob, err error) {
+	fs.Debug(f, "Reading %q", job.Path)
+	maxTries := fs.Config.LowLevelRetries
+	for tries := 1; tries <= maxTries; tries++ {
+		_, err = f.listAll(job.DirID, "", false, false, func(node *acd.Node) bool {
+			remote := job.Path + *node.Name
+			switch *node.Kind {
+			case folderKind:
+				if out.IncludeDirectory(remote) {
+					dir := &fs.Dir{
+						Name:  remote,
+						Bytes: -1,
+						Count: -1,
+					}
+					dir.When, _ = time.Parse(timeFormat, *node.ModifiedDate) // FIXME
+					if out.AddDir(dir) {
+						return true
+					}
+					if job.Depth > 0 {
+						jobs = append(jobs, dircache.ListDirJob{DirID: *node.Id, Path: remote + "/", Depth: job.Depth - 1})
+					}
 				}
-			}()
+			case fileKind:
+				o, err := f.newObjectWithInfo(remote, node)
+				if err != nil {
+					out.SetError(err)
+					return true
+				}
+				if out.Add(o) {
+					return true
+				}
+			default:
+				// ignore ASSET etc
+			}
 			return false
-		case fileKind:
-			if fs := f.newFsObjectWithInfo(path+*node.Name, node); fs != nil {
-				out <- fs
-			}
-		default:
-			// ignore ASSET etc
+		})
+		if fs.IsRetryError(err) {
+			fs.Debug(f, "Directory listing error for %q: %v - low level retry %d/%d", job.Path, err, tries, maxTries)
+			continue
 		}
-		return false
-	})
-	wg.Wait()
-	fs.Debug(f, "Finished reading %s", path)
-	if err != nil {
-		return err
-	}
-	if subError != nil {
-		return subError
-	}
-	return nil
-}
-
-// Path should be directory path either "" or "path/"
-//
-// List the directory using a recursive list from the root
-//
-// This fetches the minimum amount of stuff but does more API calls
-// which makes it slow
-func (f *Fs) listDirNonRecursive(dirID string, path string, out fs.ObjectsChan) error {
-	// Start some directory listing go routines
-	var wg sync.WaitGroup         // sync closing of go routines
-	var traversing sync.WaitGroup // running directory traversals
-	type dirListJob struct {
-		dirID string
-		path  string
-	}
-	in := make(chan dirListJob, fs.Config.Checkers)
-	errs := make(chan error, fs.Config.Checkers)
-	for i := 0; i < fs.Config.Checkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range in {
-				var jobs []dirListJob
-				fs.Debug(f, "Reading %q", job.path)
-				// Make the API request
-				_, err := f.listAll(job.dirID, "", false, false, func(node *acd.Node) bool {
-					// Recurse on directories
-					switch *node.Kind {
-					case folderKind:
-						jobs = append(jobs, dirListJob{dirID: *node.Id, path: job.path + *node.Name + "/"})
-					case fileKind:
-						if fs := f.newFsObjectWithInfo(job.path+*node.Name, node); fs != nil {
-							out <- fs
-						}
-					default:
-						// ignore ASSET etc
-					}
-					return false
-				})
-				fs.Debug(f, "Finished reading %q", job.path)
-				if err != nil {
-					fs.ErrorLog(f, "Error reading %s: %s", path, err)
-					errs <- err
-				}
-				// FIXME stop traversal on error?
-				traversing.Add(len(jobs))
-				go func() {
-					// Now we have traversed this directory, send these jobs off for traversal in
-					// the background
-					for _, job := range jobs {
-						in <- job
-					}
-				}()
-				traversing.Done()
-			}
-		}()
-	}
-
-	// Collect the errors
-	wg.Add(1)
-	var errResult error
-	go func() {
-		defer wg.Done()
-		for err := range errs {
-			errResult = err
-		}
-	}()
-
-	// Start the process
-	traversing.Add(1)
-	in <- dirListJob{dirID: dirID, path: path}
-	traversing.Wait()
-	close(in)
-	close(errs)
-	wg.Wait()
-
-	return errResult
-}
-
-// List walks the path returning a channel of FsObjects
-func (f *Fs) List() fs.ObjectsChan {
-	out := make(fs.ObjectsChan, fs.Config.Checkers)
-	go func() {
-		defer close(out)
-		err := f.dirCache.FindRoot(false)
 		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't find root: %s", err)
-		} else {
-			err = f.listDirNonRecursive(f.dirCache.RootID(), "", out)
-			if err != nil {
-				fs.Stats.Error()
-				fs.ErrorLog(f, "List failed: %s", err)
-			}
+			return nil, err
 		}
-	}()
-	return out
+		break
+	}
+	fs.Debug(f, "Finished reading %q", job.Path)
+	return jobs, err
 }
 
-// ListDir lists the directories
-func (f *Fs) ListDir() fs.DirChan {
-	out := make(fs.DirChan, fs.Config.Checkers)
-	go func() {
-		defer close(out)
-		err := f.dirCache.FindRoot(false)
-		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't find root: %s", err)
-		} else {
-			_, err := f.listAll(f.dirCache.RootID(), "", true, false, func(item *acd.Node) bool {
-				dir := &fs.Dir{
-					Name:  *item.Name,
-					Bytes: -1,
-					Count: -1,
-				}
-				dir.When, _ = time.Parse(timeFormat, *item.ModifiedDate)
-				out <- dir
-				return false
-			})
-			if err != nil {
-				fs.Stats.Error()
-				fs.ErrorLog(f, "ListDir failed: %s", err)
-			}
-		}
-	}()
-	return out
+// List walks the path returning iles and directories into out
+func (f *Fs) List(out fs.ListOpts, dir string) {
+	f.dirCache.List(f, out, dir)
 }
 
 // Put the object into the container
@@ -514,12 +421,25 @@ func (f *Fs) ListDir() fs.DirChan {
 // Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
-func (f *Fs) Put(in io.Reader, remote string, modTime time.Time, size int64) (fs.Object, error) {
+func (f *Fs) Put(in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
+	remote := src.Remote()
+	size := src.Size()
 	// Temporary Object under construction
 	o := &Object{
 		fs:     f,
 		remote: remote,
 	}
+	// Check if object already exists
+	err := o.readMetaData()
+	switch err {
+	case nil:
+		return o, o.Update(in, src)
+	case fs.ErrorObjectNotFound:
+		// Not found so create it
+	default:
+		return nil, err
+	}
+	// If not create it
 	leaf, directoryID, err := f.dirCache.FindPath(remote, true)
 	if err != nil {
 		return nil, err
@@ -531,12 +451,12 @@ func (f *Fs) Put(in io.Reader, remote string, modTime time.Time, size int64) (fs
 	var info *acd.File
 	var resp *http.Response
 	err = f.pacer.CallNoRetry(func() (bool, error) {
-		if size != 0 {
+		if src.Size() != 0 {
 			info, resp, err = folder.Put(in, leaf)
 		} else {
 			info, resp, err = folder.PutSized(in, size, leaf)
 		}
-		return shouldRetry(resp, err)
+		return f.shouldRetry(resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -554,7 +474,7 @@ func (f *Fs) Mkdir() error {
 // refuses to do so if it has anything in
 func (f *Fs) purgeCheck(check bool) error {
 	if f.root == "" {
-		return fmt.Errorf("Can't purge root directory")
+		return errors.New("can't purge root directory")
 	}
 	dc := f.dirCache
 	err := dc.FindRoot(false)
@@ -583,7 +503,7 @@ func (f *Fs) purgeCheck(check bool) error {
 			return err
 		}
 		if !empty {
-			return fmt.Errorf("Directory not empty")
+			return errors.New("directory not empty")
 		}
 	}
 
@@ -591,7 +511,7 @@ func (f *Fs) purgeCheck(check bool) error {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = node.Trash()
-		return shouldRetry(resp, err)
+		return f.shouldRetry(resp, err)
 	})
 	if err != nil {
 		return err
@@ -641,7 +561,7 @@ func (f *Fs) Hashes() fs.HashSet {
 // if err != nil {
 // 	return nil, err
 // }
-// return f.NewFsObject(remote), nil
+// return f.NewObject(remote), nil
 //}
 
 // Purge deletes all the files and the container
@@ -656,7 +576,7 @@ func (f *Fs) Purge() error {
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
-func (o *Object) Fs() fs.Fs {
+func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
@@ -692,12 +612,17 @@ func (o *Object) Size() int64 {
 // readMetaData gets the metadata if it hasn't already been fetched
 //
 // it also sets the info
+//
+// If it can't be found it returns the error fs.ErrorObjectNotFound.
 func (o *Object) readMetaData() (err error) {
 	if o.info != nil {
 		return nil
 	}
 	leaf, directoryID, err := o.fs.dirCache.FindPath(o.remote, false)
 	if err != nil {
+		if err == fs.ErrorDirNotFound {
+			return fs.ErrorObjectNotFound
+		}
 		return err
 	}
 	folder := acd.FolderFromId(directoryID, o.fs.c.Nodes)
@@ -705,10 +630,12 @@ func (o *Object) readMetaData() (err error) {
 	var info *acd.File
 	err = o.fs.pacer.Call(func() (bool, error) {
 		info, resp, err = folder.GetFile(leaf)
-		return shouldRetry(resp, err)
+		return o.fs.shouldRetry(resp, err)
 	})
 	if err != nil {
-		fs.Debug(o, "Failed to read info: %s", err)
+		if err == acd.ErrorNodeNotFound {
+			return fs.ErrorObjectNotFound
+		}
 		return err
 	}
 	o.info = info.Node
@@ -723,21 +650,21 @@ func (o *Object) readMetaData() (err error) {
 func (o *Object) ModTime() time.Time {
 	err := o.readMetaData()
 	if err != nil {
-		fs.Log(o, "Failed to read metadata: %s", err)
+		fs.Log(o, "Failed to read metadata: %v", err)
 		return time.Now()
 	}
 	modTime, err := time.Parse(timeFormat, *o.info.ModifiedDate)
 	if err != nil {
-		fs.Log(o, "Failed to read mtime from object: %s", err)
+		fs.Log(o, "Failed to read mtime from object: %v", err)
 		return time.Now()
 	}
 	return modTime
 }
 
 // SetModTime sets the modification time of the local fs object
-func (o *Object) SetModTime(modTime time.Time) {
+func (o *Object) SetModTime(modTime time.Time) error {
 	// FIXME not implemented
-	return
+	return fs.ErrorCantSetModTime
 }
 
 // Storable returns a boolean showing whether this object storable
@@ -759,7 +686,7 @@ func (o *Object) Open() (in io.ReadCloser, err error) {
 		} else {
 			in, resp, err = file.OpenTempURL(o.fs.noAuthClient)
 		}
-		return shouldRetry(resp, err)
+		return o.fs.shouldRetry(resp, err)
 	})
 	return in, err
 }
@@ -767,7 +694,8 @@ func (o *Object) Open() (in io.ReadCloser, err error) {
 // Update the object with the contents of the io.Reader, modTime and size
 //
 // The new object may have been created if an error is returned
-func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
+func (o *Object) Update(in io.Reader, src fs.ObjectInfo) error {
+	size := src.Size()
 	file := acd.File{Node: o.info}
 	var info *acd.File
 	var resp *http.Response
@@ -778,7 +706,7 @@ func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
 		} else {
 			info, resp, err = file.Overwrite(in)
 		}
-		return shouldRetry(resp, err)
+		return o.fs.shouldRetry(resp, err)
 	})
 	if err != nil {
 		return err
@@ -793,7 +721,7 @@ func (o *Object) Remove() error {
 	var err error
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.info.Trash()
-		return shouldRetry(resp, err)
+		return o.fs.shouldRetry(resp, err)
 	})
 	return err
 }

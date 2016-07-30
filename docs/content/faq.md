@@ -105,7 +105,8 @@ For instance "foo.com" also matches "bar.foo.com".
 ### Rclone gives x509: failed to load system roots and no roots provided error ###
 
 This means that `rclone` can't file the SSL root certificates.  Likely
-you are running `rclone` on a NAS with a cut-down Linux OS.
+you are running `rclone` on a NAS with a cut-down Linux OS, or
+possibly on Solaris.
 
 Rclone (via the Go runtime) tries to load the root certificates from
 these places on Linux.
@@ -123,3 +124,25 @@ mkdir -p /etc/ssl/certs/
 curl -o /etc/ssl/certs/ca-certificates.crt https://raw.githubusercontent.com/bagder/ca-bundle/master/ca-bundle.crt
 ntpclient -s -h pool.ntp.org
 ```
+
+Note that you may need to add the `--insecure` option to the `curl` command line if it doesn't work without.
+
+```
+curl --insecure -o /etc/ssl/certs/ca-certificates.crt https://raw.githubusercontent.com/bagder/ca-bundle/master/ca-bundle.crt
+```
+
+### Rclone gives Failed to load config file: function not implemented error ###
+
+Likely this means that you are running rclone on Linux version not
+supported by the go runtime, ie earlier than version 2.6.23.
+
+See the [system requirements section in the go install
+docs](https://golang.org/doc/install) for full details.
+
+### All my uploaded docx/xlsx/pptx files appear as archive/zip ###
+
+This is caused by uploading these files from a Windows computer which
+hasn't got the Microsoft Office suite installed.  The easiest way to
+fix is to install the Word viewer and the Microsoft Office
+Compatibility Pack for Word, Excel, and PowerPoint 2007 and later
+versions' file formats

@@ -9,6 +9,8 @@ import (
 	"github.com/stacktic/dropbox"
 )
 
+// FIXME Get rid of Stats.Error() counting and return errors
+
 type nameTreeNode struct {
 	// Map from lowercase directory name to tree node
 	Directories map[string]*nameTreeNode
@@ -46,7 +48,6 @@ func (tree *nameTreeNode) getTreeNode(path string) *nameTreeNode {
 		// no lookup required, just return root
 		return tree
 	}
-
 	current := tree
 	for _, component := range strings.Split(path, "/") {
 		if len(component) == 0 {
@@ -67,6 +68,29 @@ func (tree *nameTreeNode) getTreeNode(path string) *nameTreeNode {
 	}
 
 	return current
+}
+
+// PutCaseCorrectPath puts a known good path into the nameTree
+func (tree *nameTreeNode) PutCaseCorrectPath(caseCorrectPath string) {
+	if len(caseCorrectPath) == 0 {
+		return
+	}
+	current := tree
+	for _, component := range strings.Split(caseCorrectPath, "/") {
+		if len(component) == 0 {
+			fs.Stats.Error()
+			fs.ErrorLog(tree, "PutCaseCorrectPath: path component is empty (full path %q)", caseCorrectPath)
+			return
+		}
+		lowercase := strings.ToLower(component)
+		lookup := current.Directories[lowercase]
+		if lookup == nil {
+			lookup = newNameTreeNode(component)
+			current.Directories[lowercase] = lookup
+		}
+		current = lookup
+	}
+	return
 }
 
 func (tree *nameTreeNode) PutCaseCorrectDirectoryName(parentPath string, caseCorrectDirectoryName string) {
@@ -143,9 +167,9 @@ func (tree *nameTreeNode) GetPathWithCorrectCase(path string) *string {
 	return &resultString
 }
 
-type nameTreeFileWalkFunc func(caseCorrectFilePath string, entry *dropbox.Entry)
+type nameTreeFileWalkFunc func(caseCorrectFilePath string, entry *dropbox.Entry) error
 
-func (tree *nameTreeNode) walkFilesRec(currentPath string, walkFunc nameTreeFileWalkFunc) {
+func (tree *nameTreeNode) walkFilesRec(currentPath string, walkFunc nameTreeFileWalkFunc) error {
 	var prefix string
 	if currentPath == "" {
 		prefix = ""
@@ -154,7 +178,10 @@ func (tree *nameTreeNode) walkFilesRec(currentPath string, walkFunc nameTreeFile
 	}
 
 	for name, entry := range tree.Files {
-		walkFunc(prefix+name, entry)
+		err := walkFunc(prefix+name, entry)
+		if err != nil {
+			return err
+		}
 	}
 
 	for lowerCaseName, directory := range tree.Directories {
@@ -165,15 +192,20 @@ func (tree *nameTreeNode) walkFilesRec(currentPath string, walkFunc nameTreeFile
 			continue
 		}
 
-		directory.walkFilesRec(prefix+caseCorrectName, walkFunc)
+		err := directory.walkFilesRec(prefix+caseCorrectName, walkFunc)
+		if err != nil {
+			return err
+		}
 	}
+
+	return nil
 }
 
-func (tree *nameTreeNode) WalkFiles(rootPath string, walkFunc nameTreeFileWalkFunc) {
+func (tree *nameTreeNode) WalkFiles(rootPath string, walkFunc nameTreeFileWalkFunc) error {
 	node := tree.getTreeNode(rootPath)
 	if node == nil {
-		return
+		return nil
 	}
 
-	node.walkFilesRec(rootPath, walkFunc)
+	return node.walkFilesRec(rootPath, walkFunc)
 }

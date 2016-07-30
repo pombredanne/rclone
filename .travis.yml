@@ -1,24 +1,19 @@
 language: go
 sudo: false
+osx_image: xcode7.3
 
 os:
   - linux
-
-# - osx
+  - osx
 
 go:
-  - 1.4.2
-  - 1.5.3
-
-# - tip
+  - 1.5.4
+  - 1.6.2
+  - tip
 
 install:
- - go get ./...
- - '[[ `go version` =~ go1.[0-4][^0-9] ]] || go get -u github.com/kisielk/errcheck'
- - go get -u golang.org/x/tools/cmd/goimports
- - go get -u github.com/golang/lint/golint
+  - make build_dep
 
 script:
   - make check
-  - go test -v ./...
-  - go test -cpu=2 -race -v ./...
+  - make quicktest

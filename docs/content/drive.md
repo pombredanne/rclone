@@ -1,7 +1,7 @@
 ---
 title: "Google drive"
 description: "Rclone docs for Google drive"
-date: "2015-09-12"
+date: "2016-04-12"
 ---
 
 <i class="fa fa-google"></i> Google Drive
@@ -27,13 +27,31 @@ d) Delete remote
 q) Quit config
 e/n/d/q> n
 name> remote
-What type of source is it?
-Choose a number from below
- 1) swift
- 2) s3
- 3) local
- 4) drive
-type> 4
+Type of storage to configure.
+Choose a number from below, or type in your own value
+ 1 / Amazon Drive
+   \ "amazon cloud drive"
+ 2 / Amazon S3 (also Dreamhost, Ceph)
+   \ "s3"
+ 3 / Backblaze B2
+   \ "b2"
+ 4 / Dropbox
+   \ "dropbox"
+ 5 / Google Cloud Storage (this is not Google Drive)
+   \ "google cloud storage"
+ 6 / Google Drive
+   \ "drive"
+ 7 / Hubic
+   \ "hubic"
+ 8 / Local Disk
+   \ "local"
+ 9 / Microsoft OneDrive
+   \ "onedrive"
+10 / Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)
+   \ "swift"
+11 / Yandex Disk
+   \ "yandex"
+Storage> 6
 Google Application Client Id - leave blank normally.
 client_id> 
 Google Application Client Secret - leave blank normally.
@@ -111,16 +129,20 @@ system.
 
 #### --drive-chunk-size=SIZE ####
 
-Upload chunk size. Must a power of 2 >= 256k. Default value is 256kB.
+Upload chunk size. Must a power of 2 >= 256k. Default value is 8 MB.
+
+Making this larger will improve performance, but note that each chunk
+is buffered in memory one per transfer.
+
+Reducing this will reduce memory usage but decrease performance.
 
 #### --drive-full-list ####
 
-Use a full listing for directory list. More data but usually
-quicker. On by default, disable with `--full-drive-list=false`.
+No longer does anything - kept for backwards compatibility.
 
 #### --drive-upload-cutoff=SIZE ####
 
-File size cutoff for switching to chunked upload.  Default is 256kB.
+File size cutoff for switching to chunked upload.  Default is 8 MB.
 
 #### --drive-use-trash ####
 

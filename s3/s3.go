@@ -14,9 +14,9 @@ What happens if you CTRL-C a multipart upload
 */
 
 import (
-	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"path"
 	"regexp"
@@ -27,26 +27,42 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/corehandlers"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
+	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/swift"
+	"github.com/pkg/errors"
 )
 
 // Register with Fs
 func init() {
-	fs.Register(&fs.Info{
-		Name:  "s3",
-		NewFs: NewFs,
+	fs.Register(&fs.RegInfo{
+		Name:        "s3",
+		Description: "Amazon S3 (also Dreamhost, Ceph, Minio)",
+		NewFs:       NewFs,
 		// AWS endpoints: http://docs.amazonwebservices.com/general/latest/gr/rande.html#s3_region
 		Options: []fs.Option{{
+			Name: "env_auth",
+			Help: "Get AWS credentials from runtime (environment variables or EC2 meta data if no env vars). Only applies if access_key_id and secret_access_key is blank.",
+			Examples: []fs.OptionExample{
+				{
+					Value: "false",
+					Help:  "Enter AWS credentials in the next step",
+				}, {
+					Value: "true",
+					Help:  "Get AWS credentials from the environment (env vars or IAM)",
+				},
+			},
+		}, {
 			Name: "access_key_id",
-			Help: "AWS Access Key ID - leave blank for anonymous access.",
+			Help: "AWS Access Key ID - leave blank for anonymous access or runtime credentials.",
 		}, {
 			Name: "secret_access_key",
-			Help: "AWS Secret Access Key (password) - leave blank for anonymous access.",
+			Help: "AWS Secret Access Key (password) - leave blank for anonymous access or runtime credentials.",
 		}, {
 			Name: "region",
 			Help: "Region to connect to.",
@@ -75,14 +91,20 @@ func init() {
 				Value: "ap-northeast-1",
 				Help:  "Asia Pacific (Tokyo) Region\nNeeds location constraint ap-northeast-1.",
 			}, {
+				Value: "ap-northeast-2",
+				Help:  "Asia Pacific (Seoul)\nNeeds location constraint ap-northeast-2.",
+			}, {
+				Value: "ap-south-1",
+				Help:  "Asia Pacific (Mumbai)\nNeeds location constraint ap-south-1.",
+			}, {
 				Value: "sa-east-1",
 				Help:  "South America (Sao Paulo) Region\nNeeds location constraint sa-east-1.",
 			}, {
 				Value: "other-v2-signature",
-				Help:  "If using an S3 clone that only understands v2 signatures - eg Ceph - set this and make sure you set the endpoint.",
+				Help:  "If using an S3 clone that only understands v2 signatures\neg Ceph/Dreamhost\nset this and make sure you set the endpoint.",
 			}, {
 				Value: "other-v4-signature",
-				Help:  "If using an S3 clone that understands v4 signatures set this and make sure you set the endpoint.",
+				Help:  "If using an S3 clone that understands v4 signatures set this\nand make sure you set the endpoint.",
 			}},
 		}, {
 			Name: "endpoint",
@@ -115,8 +137,24 @@ func init() {
 				Value: "ap-northeast-1",
 				Help:  "Asia Pacific (Tokyo) Region.",
 			}, {
+				Value: "ap-northeast-2",
+				Help:  "Asia Pacific (Seoul)",
+			}, {
+				Value: "ap-south-1",
+				Help:  "Asia Pacific (Mumbai)",
+			}, {
 				Value: "sa-east-1",
 				Help:  "South America (Sao Paulo) Region.",
+			}},
+		}, {
+			Name: "server_side_encryption",
+			Help: "The server-side encryption algorithm used when storing this object in S3.",
+			Examples: []fs.OptionExample{{
+				Value: "",
+				Help:  "None",
+			}, {
+				Value: "AES256",
+				Help:  "AES256",
 			}},
 		}},
 	})
@@ -124,9 +162,10 @@ func init() {
 
 // Constants
 const (
-	metaMtime     = "Mtime" // the meta key to store mtime in - eg X-Amz-Meta-Mtime
-	listChunkSize = 1024    // number of items to read at once
-	maxRetries    = 10      // number of retries to make of operations
+	metaMtime      = "Mtime"                // the meta key to store mtime in - eg X-Amz-Meta-Mtime
+	listChunkSize  = 1024                   // number of items to read at once
+	maxRetries     = 10                     // number of retries to make of operations
+	maxSizeForCopy = 5 * 1024 * 1024 * 1024 // The maximum size of object we can COPY
 )
 
 // Fs represents a remote s3 server
@@ -138,6 +177,7 @@ type Fs struct {
 	perm               string           // permissions for new buckets / objects
 	root               string           // root of the bucket - ignore all objects above this
 	locationConstraint string           // location constraint of new buckets
+	sse                string           // the type of server-side encryption
 }
 
 // Object describes a s3 object
@@ -184,7 +224,7 @@ var matcher = regexp.MustCompile(`^([^/]*)(.*)$`)
 func s3ParsePath(path string) (bucket, directory string, err error) {
 	parts := matcher.FindStringSubmatch(path)
 	if parts == nil {
-		err = fmt.Errorf("Couldn't parse bucket out of s3 path %q", path)
+		err = errors.Errorf("couldn't parse bucket out of s3 path %q", path)
 	} else {
 		bucket, directory = parts[1], parts[2]
 		directory = strings.Trim(directory, "/")
@@ -195,19 +235,40 @@ func s3ParsePath(path string) (bucket, directory string, err error) {
 // s3Connection makes a connection to s3
 func s3Connection(name string) (*s3.S3, *session.Session, error) {
 	// Make the auth
-	accessKeyID := fs.ConfigFile.MustValue(name, "access_key_id")
-	secretAccessKey := fs.ConfigFile.MustValue(name, "secret_access_key")
-	var auth *credentials.Credentials
+	v := credentials.Value{
+		AccessKeyID:     fs.ConfigFile.MustValue(name, "access_key_id"),
+		SecretAccessKey: fs.ConfigFile.MustValue(name, "secret_access_key"),
+	}
+
+	// first provider to supply a credential set "wins"
+	providers := []credentials.Provider{
+		// use static credentials if they're present (checked by provider)
+		&credentials.StaticProvider{Value: v},
+
+		// * Access Key ID:     AWS_ACCESS_KEY_ID or AWS_ACCESS_KEY
+		// * Secret Access Key: AWS_SECRET_ACCESS_KEY or AWS_SECRET_KEY
+		&credentials.EnvProvider{},
+
+		// Pick up IAM role in case we're on EC2
+		&ec2rolecreds.EC2RoleProvider{
+			Client: ec2metadata.New(session.New(), &aws.Config{
+				HTTPClient: &http.Client{Timeout: 1 * time.Second}, // low timeout to ec2 metadata service
+			}),
+			ExpiryWindow: 3,
+		},
+	}
+	cred := credentials.NewChainCredentials(providers)
+
 	switch {
-	case accessKeyID == "" && secretAccessKey == "":
-		fs.Debug(name, "Using anonymous access for S3")
-		auth = credentials.AnonymousCredentials
-	case accessKeyID == "":
+	case fs.ConfigFile.MustBool(name, "env_auth", false):
+		// No need for empty checks if "env_auth" is true
+	case v.AccessKeyID == "" && v.SecretAccessKey == "":
+		// if no access key/secret and iam is explicitly disabled then fall back to anon interaction
+		cred = credentials.AnonymousCredentials
+	case v.AccessKeyID == "":
 		return nil, nil, errors.New("access_key_id not found")
-	case secretAccessKey == "":
+	case v.SecretAccessKey == "":
 		return nil, nil, errors.New("secret_access_key not found")
-	default:
-		auth = credentials.NewStaticCredentials(accessKeyID, secretAccessKey, "")
 	}
 
 	endpoint := fs.ConfigFile.MustValue(name, "endpoint")
@@ -221,7 +282,7 @@ func s3Connection(name string) (*s3.S3, *session.Session, error) {
 	awsConfig := aws.NewConfig().
 		WithRegion(region).
 		WithMaxRetries(maxRetries).
-		WithCredentials(auth).
+		WithCredentials(cred).
 		WithEndpoint(endpoint).
 		WithHTTPClient(fs.Config.Client()).
 		WithS3ForcePathStyle(true)
@@ -235,7 +296,7 @@ func s3Connection(name string) (*s3.S3, *session.Session, error) {
 			if req.Config.Credentials == credentials.AnonymousCredentials {
 				return
 			}
-			sign(accessKeyID, secretAccessKey, req.HTTPRequest)
+			sign(v.AccessKeyID, v.SecretAccessKey, req.HTTPRequest)
 		}
 		c.Handlers.Sign.Clear()
 		c.Handlers.Sign.PushBackNamed(corehandlers.BuildContentLengthHandler)
@@ -266,6 +327,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 		// FIXME perm:   s3.Private, // FIXME need user to specify
 		root:               directory,
 		locationConstraint: fs.ConfigFile.MustValue(name, "location_constraint"),
+		sse:                fs.ConfigFile.MustValue(name, "server_side_encryption"),
 	}
 	if f.root != "" {
 		f.root += "/"
@@ -276,26 +338,24 @@ func NewFs(name, root string) (fs.Fs, error) {
 		}
 		_, err = f.c.HeadObject(&req)
 		if err == nil {
-			remote := path.Base(directory)
 			f.root = path.Dir(directory)
 			if f.root == "." {
 				f.root = ""
 			} else {
 				f.root += "/"
 			}
-			obj := f.NewFsObject(remote)
-			// return a Fs Limited to this object
-			return fs.NewLimited(f, obj), nil
+			// return an error with an fs which points to the parent
+			return f, fs.ErrorIsFile
 		}
 	}
 	// f.listMultipartUploads()
 	return f, nil
 }
 
-// Return an FsObject from a path
+// Return an Object from a path
 //
-// May return nil if an error occurred
-func (f *Fs) newFsObjectWithInfo(remote string, info *s3.Object) fs.Object {
+//If it can't be found it returns the error ErrorObjectNotFound.
+func (f *Fs) newObjectWithInfo(remote string, info *s3.Object) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -313,28 +373,39 @@ func (f *Fs) newFsObjectWithInfo(remote string, info *s3.Object) fs.Object {
 	} else {
 		err := o.readMetaData() // reads info and meta, returning an error
 		if err != nil {
-			// logged already FsDebug("Failed to read info: %s", err)
-			return nil
+			return nil, err
 		}
 	}
-	return o
+	return o, nil
 }
 
-// NewFsObject returns an FsObject from a path
-//
-// May return nil if an error occurred
-func (f *Fs) NewFsObject(remote string) fs.Object {
-	return f.newFsObjectWithInfo(remote, nil)
+// NewObject finds the Object at remote.  If it can't be found
+// it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) NewObject(remote string) (fs.Object, error) {
+	return f.newObjectWithInfo(remote, nil)
 }
+
+// listFn is called from list to handle an object.
+type listFn func(remote string, object *s3.Object, isDirectory bool) error
 
 // list the objects into the function supplied
 //
-// If directories is set it only sends directories
-func (f *Fs) list(directories bool, fn func(string, *s3.Object)) {
+// dir is the starting directory, "" for root
+//
+// Level is the level of the recursion
+func (f *Fs) list(dir string, level int, fn listFn) error {
+	root := f.root
+	if dir != "" {
+		root += dir + "/"
+	}
 	maxKeys := int64(listChunkSize)
 	delimiter := ""
-	if directories {
+	switch level {
+	case 1:
 		delimiter = "/"
+	case fs.MaxLevel:
+	default:
+		return fs.ErrorLevelNotSupported
 	}
 	var marker *string
 	for {
@@ -342,134 +413,174 @@ func (f *Fs) list(directories bool, fn func(string, *s3.Object)) {
 		req := s3.ListObjectsInput{
 			Bucket:    &f.bucket,
 			Delimiter: &delimiter,
-			Prefix:    &f.root,
+			Prefix:    &root,
 			MaxKeys:   &maxKeys,
 			Marker:    marker,
 		}
 		resp, err := f.c.ListObjects(&req)
 		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't read bucket %q: %s", f.bucket, err)
+			return err
+		}
+		rootLength := len(f.root)
+		if level == 1 {
+			for _, commonPrefix := range resp.CommonPrefixes {
+				if commonPrefix.Prefix == nil {
+					fs.Log(f, "Nil common prefix received")
+					continue
+				}
+				remote := *commonPrefix.Prefix
+				if !strings.HasPrefix(remote, f.root) {
+					fs.Log(f, "Odd name received %q", remote)
+					continue
+				}
+				remote = remote[rootLength:]
+				if strings.HasSuffix(remote, "/") {
+					remote = remote[:len(remote)-1]
+				}
+				err = fn(remote, &s3.Object{Key: &remote}, true)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		for _, object := range resp.Contents {
+			key := aws.StringValue(object.Key)
+			if !strings.HasPrefix(key, f.root) {
+				fs.Log(f, "Odd name received %q", key)
+				continue
+			}
+			remote := key[rootLength:]
+			err = fn(remote, object, false)
+			if err != nil {
+				return err
+			}
+		}
+		if !aws.BoolValue(resp.IsTruncated) {
 			break
+		}
+		// Use NextMarker if set, otherwise use last Key
+		if resp.NextMarker == nil || *resp.NextMarker == "" {
+			marker = resp.Contents[len(resp.Contents)-1].Key
 		} else {
-			rootLength := len(f.root)
-			if directories {
-				for _, commonPrefix := range resp.CommonPrefixes {
-					if commonPrefix.Prefix == nil {
-						fs.Log(f, "Nil common prefix received")
-						continue
-					}
-					remote := *commonPrefix.Prefix
-					if !strings.HasPrefix(remote, f.root) {
-						fs.Log(f, "Odd name received %q", remote)
-						continue
-					}
-					remote = remote[rootLength:]
-					if strings.HasSuffix(remote, "/") {
-						remote = remote[:len(remote)-1]
-					}
-					fn(remote, &s3.Object{Key: &remote})
-				}
-			} else {
-				for _, object := range resp.Contents {
-					key := aws.StringValue(object.Key)
-					if !strings.HasPrefix(key, f.root) {
-						fs.Log(f, "Odd name received %q", key)
-						continue
-					}
-					remote := key[rootLength:]
-					fn(remote, object)
-				}
+			marker = resp.NextMarker
+		}
+	}
+	return nil
+}
+
+// listFiles lists files and directories to out
+func (f *Fs) listFiles(out fs.ListOpts, dir string) {
+	defer out.Finished()
+	if f.bucket == "" {
+		// Return no objects at top level list
+		out.SetError(errors.New("can't list objects at root - choose a bucket using lsd"))
+		return
+	}
+	// List the objects and directories
+	err := f.list(dir, out.Level(), func(remote string, object *s3.Object, isDirectory bool) error {
+		if isDirectory {
+			size := int64(0)
+			if object.Size != nil {
+				size = *object.Size
 			}
-			if !aws.BoolValue(resp.IsTruncated) {
-				break
+			dir := &fs.Dir{
+				Name:  remote,
+				Bytes: size,
+				Count: 0,
 			}
-			// Use NextMarker if set, otherwise use last Key
-			if resp.NextMarker == nil || *resp.NextMarker == "" {
-				marker = resp.Contents[len(resp.Contents)-1].Key
-			} else {
-				marker = resp.NextMarker
+			if out.AddDir(dir) {
+				return fs.ErrorListAborted
 			}
+		} else {
+			o, err := f.newObjectWithInfo(remote, object)
+			if err != nil {
+				return err
+			}
+			if out.Add(o) {
+				return fs.ErrorListAborted
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		if awsErr, ok := err.(awserr.RequestFailure); ok {
+			if awsErr.StatusCode() == http.StatusNotFound {
+				err = fs.ErrorDirNotFound
+			}
+		}
+		out.SetError(err)
+	}
+}
+
+// listBuckets lists the buckets to out
+func (f *Fs) listBuckets(out fs.ListOpts, dir string) {
+	defer out.Finished()
+	if dir != "" {
+		out.SetError(fs.ErrorListOnlyRoot)
+		return
+	}
+	req := s3.ListBucketsInput{}
+	resp, err := f.c.ListBuckets(&req)
+	if err != nil {
+		out.SetError(err)
+		return
+	}
+	for _, bucket := range resp.Buckets {
+		dir := &fs.Dir{
+			Name:  aws.StringValue(bucket.Name),
+			When:  aws.TimeValue(bucket.CreationDate),
+			Bytes: -1,
+			Count: -1,
+		}
+		if out.AddDir(dir) {
+			break
 		}
 	}
 }
 
-// List walks the path returning a channel of FsObjects
-func (f *Fs) List() fs.ObjectsChan {
-	out := make(fs.ObjectsChan, fs.Config.Checkers)
+// List lists files and directories to out
+func (f *Fs) List(out fs.ListOpts, dir string) {
 	if f.bucket == "" {
-		// Return no objects at top level list
-		close(out)
-		fs.Stats.Error()
-		fs.ErrorLog(f, "Can't list objects at root - choose a bucket using lsd")
+		f.listBuckets(out, dir)
 	} else {
-		go func() {
-			defer close(out)
-			f.list(false, func(remote string, object *s3.Object) {
-				if fs := f.newFsObjectWithInfo(remote, object); fs != nil {
-					out <- fs
-				}
-			})
-		}()
+		f.listFiles(out, dir)
 	}
-	return out
+	return
 }
 
-// ListDir lists the buckets
-func (f *Fs) ListDir() fs.DirChan {
-	out := make(fs.DirChan, fs.Config.Checkers)
-	if f.bucket == "" {
-		// List the buckets
-		go func() {
-			defer close(out)
-			req := s3.ListBucketsInput{}
-			resp, err := f.c.ListBuckets(&req)
-			if err != nil {
-				fs.Stats.Error()
-				fs.ErrorLog(f, "Couldn't list buckets: %s", err)
-			} else {
-				for _, bucket := range resp.Buckets {
-					out <- &fs.Dir{
-						Name:  aws.StringValue(bucket.Name),
-						When:  aws.TimeValue(bucket.CreationDate),
-						Bytes: -1,
-						Count: -1,
-					}
-				}
-			}
-		}()
-	} else {
-		// List the directories in the path in the bucket
-		go func() {
-			defer close(out)
-			f.list(true, func(remote string, object *s3.Object) {
-				size := int64(0)
-				if object.Size != nil {
-					size = *object.Size
-				}
-				out <- &fs.Dir{
-					Name:  remote,
-					Bytes: size,
-					Count: 0,
-				}
-			})
-		}()
-	}
-	return out
-}
-
-// Put the FsObject into the bucket
-func (f *Fs) Put(in io.Reader, remote string, modTime time.Time, size int64) (fs.Object, error) {
+// Put the Object into the bucket
+func (f *Fs) Put(in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
 	// Temporary Object under construction
 	fs := &Object{
 		fs:     f,
-		remote: remote,
+		remote: src.Remote(),
 	}
-	return fs, fs.Update(in, modTime, size)
+	return fs, fs.Update(in, src)
+}
+
+// Check if the bucket exists
+func (f *Fs) dirExists() (bool, error) {
+	req := s3.HeadBucketInput{
+		Bucket: &f.bucket,
+	}
+	_, err := f.c.HeadBucket(&req)
+	if err == nil {
+		return true, nil
+	}
+	if err, ok := err.(awserr.RequestFailure); ok {
+		if err.StatusCode() == http.StatusNotFound {
+			return false, nil
+		}
+	}
+	return false, err
 }
 
 // Mkdir creates the bucket if it doesn't exist
 func (f *Fs) Mkdir() error {
+	exists, err := f.dirExists()
+	if err != nil || exists {
+		return err
+	}
 	req := s3.CreateBucketInput{
 		Bucket: &f.bucket,
 		ACL:    &f.perm,
@@ -479,7 +590,7 @@ func (f *Fs) Mkdir() error {
 			LocationConstraint: &f.locationConstraint,
 		}
 	}
-	_, err := f.c.CreateBucket(&req)
+	_, err = f.c.CreateBucket(&req)
 	if err, ok := err.(awserr.Error); ok {
 		if err.Code() == "BucketAlreadyOwnedByYou" {
 			return nil
@@ -535,7 +646,7 @@ func (f *Fs) Copy(src fs.Object, remote string) (fs.Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	return f.NewFsObject(remote), err
+	return f.NewObject(remote)
 }
 
 // Hashes returns the supported hash sets.
@@ -546,7 +657,7 @@ func (f *Fs) Hashes() fs.HashSet {
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
-func (o *Object) Fs() fs.Fs {
+func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
@@ -598,7 +709,11 @@ func (o *Object) readMetaData() (err error) {
 	}
 	resp, err := o.fs.c.HeadObject(&req)
 	if err != nil {
-		fs.Debug(o, "Failed to read info: %s", err)
+		if awsErr, ok := err.(awserr.RequestFailure); ok {
+			if awsErr.StatusCode() == http.StatusNotFound {
+				return fs.ErrorObjectNotFound
+			}
+		}
 		return err
 	}
 	var size int64
@@ -611,7 +726,7 @@ func (o *Object) readMetaData() (err error) {
 	o.bytes = size
 	o.meta = resp.Metadata
 	if resp.LastModified == nil {
-		fs.Log(o, "Failed to read last modified from HEAD: %s", err)
+		fs.Log(o, "Failed to read last modified from HEAD: %v", err)
 		o.lastModified = time.Now()
 	} else {
 		o.lastModified = *resp.LastModified
@@ -626,7 +741,7 @@ func (o *Object) readMetaData() (err error) {
 func (o *Object) ModTime() time.Time {
 	err := o.readMetaData()
 	if err != nil {
-		fs.Log(o, "Failed to read metadata: %s", err)
+		fs.Log(o, "Failed to read metadata: %v", err)
 		return time.Now()
 	}
 	// read mtime out of metadata if available
@@ -637,21 +752,24 @@ func (o *Object) ModTime() time.Time {
 	}
 	modTime, err := swift.FloatStringToTime(*d)
 	if err != nil {
-		fs.Log(o, "Failed to read mtime from object: %s", err)
+		fs.Log(o, "Failed to read mtime from object: %v", err)
 		return o.lastModified
 	}
 	return modTime
 }
 
 // SetModTime sets the modification time of the local fs object
-func (o *Object) SetModTime(modTime time.Time) {
+func (o *Object) SetModTime(modTime time.Time) error {
 	err := o.readMetaData()
 	if err != nil {
-		fs.Stats.Error()
-		fs.ErrorLog(o, "Failed to read metadata: %s", err)
-		return
+		return err
 	}
 	o.meta[metaMtime] = aws.String(swift.TimeToFloatString(modTime))
+
+	if o.bytes >= maxSizeForCopy {
+		fs.Debug(o, "SetModTime is unsupported for objects bigger than %v bytes", fs.SizeSuffix(maxSizeForCopy))
+		return nil
+	}
 
 	// Guess the content type
 	contentType := fs.MimeType(o)
@@ -670,10 +788,7 @@ func (o *Object) SetModTime(modTime time.Time) {
 		MetadataDirective: &directive,
 	}
 	_, err = o.fs.c.CopyObject(&req)
-	if err != nil {
-		fs.Stats.Error()
-		fs.ErrorLog(o, "Failed to update remote mtime: %s", err)
-	}
+	return err
 }
 
 // Storable raturns a boolean indicating if this object is storable
@@ -696,11 +811,21 @@ func (o *Object) Open() (in io.ReadCloser, err error) {
 }
 
 // Update the Object from in with modTime and size
-func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
+func (o *Object) Update(in io.Reader, src fs.ObjectInfo) error {
+	modTime := src.ModTime()
+
 	uploader := s3manager.NewUploader(o.fs.ses, func(u *s3manager.Uploader) {
 		u.Concurrency = 2
 		u.LeavePartsOnError = false
 		u.S3 = o.fs.c
+		u.PartSize = s3manager.MinUploadPartSize
+		size := src.Size()
+
+		// Adjust PartSize until the number of parts is small enough.
+		if size/u.PartSize >= s3manager.MaxUploadParts {
+			// Calculate partition size rounded up to the nearest MB
+			u.PartSize = (((size / s3manager.MaxUploadParts) >> 20) + 1) << 20
+		}
 	})
 
 	// Set the mtime in the meta data
@@ -720,6 +845,9 @@ func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
 		ContentType: &contentType,
 		Metadata:    metadata,
 		//ContentLength: &size,
+	}
+	if o.fs.sse != "" {
+		req.ServerSideEncryption = &o.fs.sse
 	}
 	_, err := uploader.Upload(&req)
 	if err != nil {

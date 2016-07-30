@@ -1,9 +1,10 @@
 package src
 
 import (
-	"fmt"
 	"io/ioutil"
 	"net/http"
+
+	"github.com/pkg/errors"
 )
 
 // PerformDelete does the actual delete via DELETE request.
@@ -16,7 +17,7 @@ func (c *Client) PerformDelete(url string) error {
 	//set access token and headers
 	c.setRequestScope(req)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -28,7 +29,7 @@ func (c *Client) PerformDelete(url string) error {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("delete error [%d]: %s", resp.StatusCode, string(body[:]))
+		return errors.Errorf("delete error [%d]: %s", resp.StatusCode, string(body[:]))
 	}
 	return nil
 }

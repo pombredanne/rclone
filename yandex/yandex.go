@@ -16,13 +16,14 @@ import (
 	"github.com/ncw/rclone/fs"
 	"github.com/ncw/rclone/oauthutil"
 	yandex "github.com/ncw/rclone/yandex/api"
+	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 )
 
 //oAuth
 const (
-	rcloneClientID     = "ac39b43b9eba4cae8ffb788c06d816a8"
-	rcloneClientSecret = "k8jKzZnMmM+Wx5jAksPAwYKPgImOiN+FhNKD09KBg9A="
+	rcloneClientID              = "ac39b43b9eba4cae8ffb788c06d816a8"
+	rcloneEncryptedClientSecret = "k8jKzZnMmM+Wx5jAksPAwYKPgImOiN+FhNKD09KBg9A="
 )
 
 // Globals
@@ -34,16 +35,17 @@ var (
 			TokenURL: "https://oauth.yandex.com/token",     //same as https://oauth.yandex.ru/token
 		},
 		ClientID:     rcloneClientID,
-		ClientSecret: fs.Reveal(rcloneClientSecret),
+		ClientSecret: fs.Reveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.RedirectURL,
 	}
 )
 
 // Register with Fs
 func init() {
-	fs.Register(&fs.Info{
-		Name:  "yandex",
-		NewFs: NewFs,
+	fs.Register(&fs.RegInfo{
+		Name:        "yandex",
+		Description: "Yandex Disk",
+		NewFs:       NewFs,
 		Config: func(name string) {
 			err := oauthutil.Config("yandex", name, oauthConfig)
 			if err != nil {
@@ -126,7 +128,6 @@ func NewFs(name, root string) (fs.Fs, error) {
 
 	f.setRoot(root)
 
-	//limited fs
 	// Check to see if the object exists and is a file
 	//request object meta info
 	var opt2 yandex.ResourceInfoRequestOptions
@@ -134,13 +135,9 @@ func NewFs(name, root string) (fs.Fs, error) {
 		//return err
 	} else {
 		if ResourceInfoResponse.ResourceType == "file" {
-			//limited fs
-			remote := path.Base(root)
 			f.setRoot(path.Dir(root))
-
-			obj := f.newFsObjectWithInfo(remote, ResourceInfoResponse)
-			// return a Fs Limited to this object
-			return fs.NewLimited(f, obj), nil
+			// return an error with an fs which points to the parent
+			return f, fs.ErrorIsFile
 		}
 	}
 
@@ -162,10 +159,44 @@ func (f *Fs) setRoot(root string) {
 	f.diskRoot = diskRoot
 }
 
+// listFn is called from list and listContainerRoot to handle an object.
+type listFn func(remote string, item *yandex.ResourceInfoResponse, isDirectory bool) error
+
+// listDir lists this directory only returning objects and directories
+func (f *Fs) listDir(fn listFn) (err error) {
+	//request object meta info
+	var opt yandex.ResourceInfoRequestOptions
+	ResourceInfoResponse, err := f.yd.NewResourceInfoRequest(f.diskRoot, opt).Exec()
+	if err != nil {
+		return err
+	}
+	if ResourceInfoResponse.ResourceType == "dir" {
+		//list all subdirs
+		for _, element := range ResourceInfoResponse.Embedded.Items {
+			remote := element.Name
+			switch element.ResourceType {
+			case "dir":
+				err = fn(remote, &element, true)
+				if err != nil {
+					return err
+				}
+			case "file":
+				err = fn(remote, &element, false)
+				if err != nil {
+					return err
+				}
+			default:
+				fs.Debug(f, "Unknown resource type %q", element.ResourceType)
+			}
+		}
+	}
+	return nil
+}
+
 // list the objects into the function supplied
 //
-// If directories is set it only sends directories
-func (f *Fs) list(directories bool, fn func(string, yandex.ResourceInfoResponse)) {
+// This does a flat listing of all the files in the drive
+func (f *Fs) list(dir string, fn listFn) error {
 	//request files list. list is divided into pages. We send request for each page
 	//items per page is limited by limit
 	//TODO may be add config parameter for the items per page limit
@@ -176,24 +207,29 @@ func (f *Fs) list(directories bool, fn func(string, yandex.ResourceInfoResponse)
 	var opt yandex.FlatFileListRequestOptions
 	opt.Limit = &limit
 	opt.Offset = &offset
+	prefix := f.diskRoot
+	if dir != "" {
+		prefix += dir + "/"
+	}
 	//query each page of list until itemCount is less then limit
 	for {
 		//send request
 		info, err := f.yd.NewFlatFileListRequest(opt).Exec()
 		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't list: %s", err)
-			return
+			return err
 		}
 		itemsCount = uint32(len(info.Items))
 
 		//list files
 		for _, item := range info.Items {
 			// filter file list and get only files we need
-			if strings.HasPrefix(item.Path, f.diskRoot) {
+			if strings.HasPrefix(item.Path, prefix) {
 				//trim root folder from filename
 				var name = strings.TrimPrefix(item.Path, f.diskRoot)
-				fn(name, item)
+				err = fn(name, &item, false)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -204,34 +240,73 @@ func (f *Fs) list(directories bool, fn func(string, yandex.ResourceInfoResponse)
 			break
 		}
 	}
+	return nil
 }
 
-// List walks the path returning a channel of FsObjects
-func (f *Fs) List() fs.ObjectsChan {
-	out := make(fs.ObjectsChan, fs.Config.Checkers)
-	// List the objects
-	go func() {
-		defer close(out)
-		f.list(false, func(remote string, object yandex.ResourceInfoResponse) {
-			if fs := f.newFsObjectWithInfo(remote, &object); fs != nil {
-				out <- fs
+// List walks the path returning a channel of Objects
+func (f *Fs) List(out fs.ListOpts, dir string) {
+	defer out.Finished()
+
+	listItem := func(remote string, object *yandex.ResourceInfoResponse, isDirectory bool) error {
+		if isDirectory {
+			t, err := time.Parse(time.RFC3339Nano, object.Modified)
+			if err != nil {
+				return err
 			}
-		})
-	}()
-	return out
+			dir := &fs.Dir{
+				Name:  remote,
+				When:  t,
+				Bytes: int64(object.Size),
+				Count: -1,
+			}
+			if out.AddDir(dir) {
+				return fs.ErrorListAborted
+			}
+		} else {
+			o, err := f.newObjectWithInfo(remote, object)
+			if err != nil {
+				return err
+			}
+			if out.Add(o) {
+				return fs.ErrorListAborted
+			}
+		}
+		return nil
+	}
+
+	var err error
+	switch out.Level() {
+	case 1:
+		if dir == "" {
+			err = f.listDir(listItem)
+		} else {
+			err = f.list(dir, listItem)
+		}
+	case fs.MaxLevel:
+		err = f.list(dir, listItem)
+	default:
+		out.SetError(fs.ErrorLevelNotSupported)
+	}
+
+	if err != nil {
+		// FIXME
+		// if err == swift.ContainerNotFound {
+		// 	err = fs.ErrorDirNotFound
+		// }
+		out.SetError(err)
+	}
 }
 
-// NewFsObject returns an Object from a path
-//
-// May return nil if an error occurred
-func (f *Fs) NewFsObject(remote string) fs.Object {
-	return f.newFsObjectWithInfo(remote, nil)
+// NewObject finds the Object at remote.  If it can't be found it
+// returns the error fs.ErrorObjectNotFound.
+func (f *Fs) NewObject(remote string) (fs.Object, error) {
+	return f.newObjectWithInfo(remote, nil)
 }
 
-// Return an FsObject from a path
+// Return an Object from a path
 //
-// May return nil if an error occurred
-func (f *Fs) newFsObjectWithInfo(remote string, info *yandex.ResourceInfoResponse) fs.Object {
+// If it can't be found it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) newObjectWithInfo(remote string, info *yandex.ResourceInfoResponse) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -241,11 +316,10 @@ func (f *Fs) newFsObjectWithInfo(remote string, info *yandex.ResourceInfoRespons
 	} else {
 		err := o.readMetaData()
 		if err != nil {
-			fs.ErrorLog(f, "Couldn't get object '%s' metadata: %s", o.remotePath(), err)
-			return nil
+			return nil, err
 		}
 	}
-	return o
+	return o, nil
 }
 
 // setMetaData sets the fs data from a storage.Object
@@ -281,44 +355,15 @@ func (o *Object) readMetaData() (err error) {
 	var opt2 yandex.ResourceInfoRequestOptions
 	ResourceInfoResponse, err := o.fs.yd.NewResourceInfoRequest(o.remotePath(), opt2).Exec()
 	if err != nil {
+		if dcErr, ok := err.(yandex.DiskClientError); ok {
+			if dcErr.Code == "DiskNotFoundError" {
+				return fs.ErrorObjectNotFound
+			}
+		}
 		return err
 	}
 	o.setMetaData(ResourceInfoResponse)
 	return nil
-}
-
-// ListDir walks the path returning a channel of FsObjects
-func (f *Fs) ListDir() fs.DirChan {
-	out := make(fs.DirChan, fs.Config.Checkers)
-	go func() {
-		defer close(out)
-
-		//request object meta info
-		var opt yandex.ResourceInfoRequestOptions
-		ResourceInfoResponse, err := f.yd.NewResourceInfoRequest(f.diskRoot, opt).Exec()
-		if err != nil {
-			return
-		}
-		if ResourceInfoResponse.ResourceType == "dir" {
-			//list all subdirs
-			for _, element := range ResourceInfoResponse.Embedded.Items {
-				if element.ResourceType == "dir" {
-					t, err := time.Parse(time.RFC3339Nano, element.Modified)
-					if err != nil {
-						return
-					}
-					out <- &fs.Dir{
-						Name:  element.Name,
-						When:  t,
-						Bytes: int64(element.Size),
-						Count: -1,
-					}
-				}
-			}
-		}
-
-	}()
-	return out
 }
 
 // Put the object
@@ -326,7 +371,11 @@ func (f *Fs) ListDir() fs.DirChan {
 // Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
-func (f *Fs) Put(in io.Reader, remote string, modTime time.Time, size int64) (fs.Object, error) {
+func (f *Fs) Put(in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
+	remote := src.Remote()
+	size := src.Size()
+	modTime := src.ModTime()
+
 	o := &Object{
 		fs:      f,
 		remote:  remote,
@@ -334,7 +383,7 @@ func (f *Fs) Put(in io.Reader, remote string, modTime time.Time, size int64) (fs
 		modTime: modTime,
 	}
 	//TODO maybe read metadata after upload to check if file uploaded successfully
-	return o, o.Update(in, modTime, size)
+	return o, o.Update(in, src)
 }
 
 // Mkdir creates the container if it doesn't exist
@@ -358,10 +407,10 @@ func (f *Fs) purgeCheck(check bool) error {
 		var opt yandex.ResourceInfoRequestOptions
 		ResourceInfoResponse, err := f.yd.NewResourceInfoRequest(f.diskRoot, opt).Exec()
 		if err != nil {
-			return fmt.Errorf("Rmdir failed: %s", err)
+			return errors.Wrap(err, "rmdir failed")
 		}
 		if len(ResourceInfoResponse.Embedded.Items) != 0 {
-			return fmt.Errorf("Rmdir failed: Directory not empty")
+			return errors.New("rmdir failed: directory not empty")
 		}
 	}
 	//delete directory
@@ -390,7 +439,7 @@ func (f *Fs) Hashes() fs.HashSet {
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
-func (o *Object) Fs() fs.Fs {
+func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
@@ -428,7 +477,7 @@ func (o *Object) Size() int64 {
 func (o *Object) ModTime() time.Time {
 	err := o.readMetaData()
 	if err != nil {
-		fs.Log(o, "Failed to read metadata: %s", err)
+		fs.Log(o, "Failed to read metadata: %v", err)
 		return time.Now()
 	}
 	return o.modTime
@@ -447,14 +496,10 @@ func (o *Object) Remove() error {
 // SetModTime sets the modification time of the local fs object
 //
 // Commits the datastore
-func (o *Object) SetModTime(modTime time.Time) {
+func (o *Object) SetModTime(modTime time.Time) error {
 	remote := o.remotePath()
 	//set custom_property 'rclone_modified' of object to modTime
-	err := o.fs.yd.SetCustomProperty(remote, "rclone_modified", modTime.Format(time.RFC3339Nano))
-	if err != nil {
-		return
-	}
-	return
+	return o.fs.yd.SetCustomProperty(remote, "rclone_modified", modTime.Format(time.RFC3339Nano))
 }
 
 // Storable returns whether this object is storable
@@ -472,7 +517,10 @@ func (o *Object) remotePath() string {
 // Copy the reader into the object updating modTime and size
 //
 // The new object may have been created if an error is returned
-func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
+func (o *Object) Update(in io.Reader, src fs.ObjectInfo) error {
+	size := src.Size()
+	modTime := src.ModTime()
+
 	remote := o.remotePath()
 	//create full path to file before upload.
 	err1 := mkDirFullPath(o.fs.yd, remote)
@@ -483,12 +531,12 @@ func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
 	overwrite := true //overwrite existing file
 	err := o.fs.yd.Upload(in, remote, overwrite)
 	if err == nil {
-		//if file uploaded sucessfuly then return metadata
+		//if file uploaded sucessfully then return metadata
 		o.bytes = uint64(size)
 		o.modTime = modTime
 		o.md5sum = "" // according to unit tests after put the md5 is empty.
 		//and set modTime of uploaded file
-		o.SetModTime(modTime)
+		err = o.SetModTime(modTime)
 	}
 	return err
 }
@@ -506,8 +554,7 @@ func mkDirExecute(client *yandex.Client, path string) (int, string, error) {
 	}
 	if err != nil {
 		// error creating directory
-		log.Printf("Failed to create folder: %v", err)
-		return statusCode, jsonErrorString, err
+		return statusCode, jsonErrorString, errors.Wrap(err, "failed to create folder")
 	}
 	return 0, "", nil
 }

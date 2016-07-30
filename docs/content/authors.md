@@ -1,7 +1,7 @@
 ---
 title: "Authors"
 description: "Rclone Authors and Contributors"
-date: "2015-09-28"
+date: "2016-04-22"
 ---
 
 Authors
@@ -25,3 +25,13 @@ Contributors
   * Björn Harrtell <bjorn@wololo.org>
   * Xavier Lucas <xavier.lucas@corp.ovh.com>
   * Werner Beroux <werner@beroux.com>
+  * Brian Stengaard <brian@stengaard.eu>
+  * Jakub Gedeon <jgedeon@sofi.com>
+  * Jim Tittsler <jwt@onjapan.net>
+  * Michal Witkowski <michal@improbable.io>
+  * Fabian Ruff <fabian.ruff@sap.com>
+  * Leigh Klotz <klotz@quixey.com>
+  * Romain Lapray <lapray.romain@gmail.com>
+  * Justin R. Wilson <jrw972@gmail.com>
+  * Antonio Messina <antonio.s.messina@gmail.com>
+  * Stefan G. Weichinger <office@oops.co.at>

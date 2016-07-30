@@ -17,29 +17,31 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"path"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/ncw/rclone/fs"
+	"github.com/ncw/rclone/oauthutil"
+	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/storage/v1"
-
-	"github.com/ncw/rclone/fs"
-	"github.com/ncw/rclone/oauthutil"
 )
 
 const (
-	rcloneClientID     = "202264815644.apps.googleusercontent.com"
-	rcloneClientSecret = "8p/yms3OlNXE9OTDl/HLypf9gdiJ5cT3"
-	timeFormatIn       = time.RFC3339
-	timeFormatOut      = "2006-01-02T15:04:05.000000000Z07:00"
-	metaMtime          = "mtime" // key to store mtime under in metadata
-	listChunks         = 256     // chunk size to read directory listings
+	rcloneClientID              = "202264815644.apps.googleusercontent.com"
+	rcloneEncryptedClientSecret = "8p/yms3OlNXE9OTDl/HLypf9gdiJ5cT3"
+	timeFormatIn                = time.RFC3339
+	timeFormatOut               = "2006-01-02T15:04:05.000000000Z07:00"
+	metaMtime                   = "mtime" // key to store mtime under in metadata
+	listChunks                  = 256     // chunk size to read directory listings
 )
 
 var (
@@ -48,17 +50,21 @@ var (
 		Scopes:       []string{storage.DevstorageFullControlScope},
 		Endpoint:     google.Endpoint,
 		ClientID:     rcloneClientID,
-		ClientSecret: fs.Reveal(rcloneClientSecret),
+		ClientSecret: fs.Reveal(rcloneEncryptedClientSecret),
 		RedirectURL:  oauthutil.TitleBarRedirectURL,
 	}
 )
 
 // Register with Fs
 func init() {
-	fs.Register(&fs.Info{
-		Name:  "google cloud storage",
-		NewFs: NewFs,
+	fs.Register(&fs.RegInfo{
+		Name:        "google cloud storage",
+		Description: "Google Cloud Storage (this is not Google Drive)",
+		NewFs:       NewFs,
 		Config: func(name string) {
+			if fs.ConfigFile.MustValue(name, "service_account_file") != "" {
+				return
+			}
 			err := oauthutil.Config("google cloud storage", name, storageConfig)
 			if err != nil {
 				log.Fatalf("Failed to configure token: %v", err)
@@ -73,6 +79,9 @@ func init() {
 		}, {
 			Name: "project_number",
 			Help: "Project number optional - needed only for list/create/delete buckets - see your developer console.",
+		}, {
+			Name: "service_account_file",
+			Help: "Service Account Credentials JSON file path - needed only if you want use SA instead of interactive login.",
 		}, {
 			Name: "object_acl",
 			Help: "Access Control List for new objects.",
@@ -172,7 +181,7 @@ var matcher = regexp.MustCompile(`^([^/]*)(.*)$`)
 func parsePath(path string) (bucket, directory string, err error) {
 	parts := matcher.FindStringSubmatch(path)
 	if parts == nil {
-		err = fmt.Errorf("Couldn't find bucket in storage path %q", path)
+		err = errors.Errorf("couldn't find bucket in storage path %q", path)
 	} else {
 		bucket, directory = parts[1], parts[2]
 		directory = strings.Trim(directory, "/")
@@ -180,11 +189,35 @@ func parsePath(path string) (bucket, directory string, err error) {
 	return
 }
 
+func getServiceAccountClient(keyJsonfilePath string) (*http.Client, error) {
+	data, err := ioutil.ReadFile(os.ExpandEnv(keyJsonfilePath))
+	if err != nil {
+		return nil, errors.Wrap(err, "error opening credentials file")
+	}
+	conf, err := google.JWTConfigFromJSON(data, storageConfig.Scopes...)
+	if err != nil {
+		return nil, errors.Wrap(err, "error processing credentials")
+	}
+	ctxWithSpecialClient := oauthutil.Context()
+	return oauth2.NewClient(ctxWithSpecialClient, conf.TokenSource(ctxWithSpecialClient)), nil
+}
+
 // NewFs contstructs an Fs from the path, bucket:path
 func NewFs(name, root string) (fs.Fs, error) {
-	oAuthClient, err := oauthutil.NewClient(name, storageConfig)
-	if err != nil {
-		log.Fatalf("Failed to configure Google Cloud Storage: %v", err)
+	var oAuthClient *http.Client
+	var err error
+
+	serviceAccountPath := fs.ConfigFile.MustValue(name, "service_account_file")
+	if serviceAccountPath != "" {
+		oAuthClient, err = getServiceAccountClient(serviceAccountPath)
+		if err != nil {
+			log.Fatalf("Failed configuring Google Cloud Storage Service Account: %v", err)
+		}
+	} else {
+		oAuthClient, _, err = oauthutil.NewClient(name, storageConfig)
+		if err != nil {
+			log.Fatalf("Failed to configure Google Cloud Storage: %v", err)
+		}
 	}
 
 	bucket, directory, err := parsePath(root)
@@ -211,7 +244,7 @@ func NewFs(name, root string) (fs.Fs, error) {
 	f.client = oAuthClient
 	f.svc, err = storage.New(f.client)
 	if err != nil {
-		return nil, fmt.Errorf("Couldn't create Google Cloud Storage client: %s", err)
+		return nil, errors.Wrap(err, "couldn't create Google Cloud Storage client")
 	}
 
 	if f.root != "" {
@@ -219,25 +252,23 @@ func NewFs(name, root string) (fs.Fs, error) {
 		// Check to see if the object exists
 		_, err = f.svc.Objects.Get(bucket, directory).Do()
 		if err == nil {
-			remote := path.Base(directory)
 			f.root = path.Dir(directory)
 			if f.root == "." {
 				f.root = ""
 			} else {
 				f.root += "/"
 			}
-			obj := f.NewFsObject(remote)
-			// return a Fs Limited to this object
-			return fs.NewLimited(f, obj), nil
+			// return an error with an fs which points to the parent
+			return f, fs.ErrorIsFile
 		}
 	}
 	return f, nil
 }
 
-// Return an FsObject from a path
+// Return an Object from a path
 //
-// May return nil if an error occurred
-func (f *Fs) newFsObjectWithInfo(remote string, info *storage.Object) fs.Object {
+// If it can't be found it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) newObjectWithInfo(remote string, info *storage.Object) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -247,52 +278,66 @@ func (f *Fs) newFsObjectWithInfo(remote string, info *storage.Object) fs.Object 
 	} else {
 		err := o.readMetaData() // reads info and meta, returning an error
 		if err != nil {
-			// logged already FsDebug("Failed to read info: %s", err)
-			return nil
+			return nil, err
 		}
 	}
-	return o
+	return o, nil
 }
 
-// NewFsObject returns an FsObject from a path
-//
-// May return nil if an error occurred
-func (f *Fs) NewFsObject(remote string) fs.Object {
-	return f.newFsObjectWithInfo(remote, nil)
+// NewObject finds the Object at remote.  If it can't be found
+// it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) NewObject(remote string) (fs.Object, error) {
+	return f.newObjectWithInfo(remote, nil)
 }
+
+// listFn is called from list to handle an object.
+type listFn func(remote string, object *storage.Object, isDirectory bool) error
 
 // list the objects into the function supplied
 //
+// dir is the starting directory, "" for root
+//
 // If directories is set it only sends directories
-func (f *Fs) list(directories bool, fn func(string, *storage.Object)) {
-	list := f.svc.Objects.List(f.bucket).Prefix(f.root).MaxResults(listChunks)
-	if directories {
-		list = list.Delimiter("/")
+func (f *Fs) list(dir string, level int, fn listFn) error {
+	root := f.root
+	rootLength := len(root)
+	if dir != "" {
+		root += dir + "/"
 	}
-	rootLength := len(f.root)
+	list := f.svc.Objects.List(f.bucket).Prefix(root).MaxResults(listChunks)
+	switch level {
+	case 1:
+		list = list.Delimiter("/")
+	case fs.MaxLevel:
+	default:
+		return fs.ErrorLevelNotSupported
+	}
 	for {
 		objects, err := list.Do()
 		if err != nil {
-			fs.Stats.Error()
-			fs.ErrorLog(f, "Couldn't read bucket %q: %s", f.bucket, err)
-			return
+			return err
 		}
-		if !directories {
-			for _, object := range objects.Items {
-				if !strings.HasPrefix(object.Name, f.root) {
-					fs.Log(f, "Odd name received %q", object.Name)
-					continue
-				}
-				remote := object.Name[rootLength:]
-				fn(remote, object)
-			}
-		} else {
+		if level == 1 {
 			var object storage.Object
 			for _, prefix := range objects.Prefixes {
 				if !strings.HasSuffix(prefix, "/") {
 					continue
 				}
-				fn(prefix[:len(prefix)-1], &object)
+				err = fn(prefix[:len(prefix)-1], &object, true)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		for _, object := range objects.Items {
+			if !strings.HasPrefix(object.Name, root) {
+				fs.Log(f, "Odd name received %q", object.Name)
+				continue
+			}
+			remote := object.Name[rootLength:]
+			err = fn(remote, object, false)
+			if err != nil {
+				return err
 			}
 		}
 		if objects.NextPageToken == "" {
@@ -300,78 +345,91 @@ func (f *Fs) list(directories bool, fn func(string, *storage.Object)) {
 		}
 		list.PageToken(objects.NextPageToken)
 	}
+	return nil
 }
 
-// List walks the path returning a channel of FsObjects
-func (f *Fs) List() fs.ObjectsChan {
-	out := make(fs.ObjectsChan, fs.Config.Checkers)
+// listFiles lists files and directories to out
+func (f *Fs) listFiles(out fs.ListOpts, dir string) {
+	defer out.Finished()
 	if f.bucket == "" {
-		// Return no objects at top level list
-		close(out)
-		fs.Stats.Error()
-		fs.ErrorLog(f, "Can't list objects at root - choose a bucket using lsd")
-	} else {
-		// List the objects
-		go func() {
-			defer close(out)
-			f.list(false, func(remote string, object *storage.Object) {
-				if fs := f.newFsObjectWithInfo(remote, object); fs != nil {
-					out <- fs
-				}
-			})
-		}()
+		out.SetError(errors.New("can't list objects at root - choose a bucket using lsd"))
+		return
 	}
-	return out
+	// List the objects
+	err := f.list(dir, out.Level(), func(remote string, object *storage.Object, isDirectory bool) error {
+		if isDirectory {
+			dir := &fs.Dir{
+				Name:  remote,
+				Bytes: int64(object.Size),
+				Count: 0,
+			}
+			if out.AddDir(dir) {
+				return fs.ErrorListAborted
+			}
+		} else {
+			o, err := f.newObjectWithInfo(remote, object)
+			if err != nil {
+				return err
+			}
+			if out.Add(o) {
+				return fs.ErrorListAborted
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		if gErr, ok := err.(*googleapi.Error); ok {
+			if gErr.Code == http.StatusNotFound {
+				err = fs.ErrorDirNotFound
+			}
+		}
+		out.SetError(err)
+	}
 }
 
-// ListDir lists the buckets
-func (f *Fs) ListDir() fs.DirChan {
-	out := make(fs.DirChan, fs.Config.Checkers)
-	if f.bucket == "" {
-		// List the buckets
-		go func() {
-			defer close(out)
-			if f.projectNumber == "" {
-				fs.Stats.Error()
-				fs.ErrorLog(f, "Can't list buckets without project number")
+// listBuckets lists the buckets to out
+func (f *Fs) listBuckets(out fs.ListOpts, dir string) {
+	defer out.Finished()
+	if dir != "" {
+		out.SetError(fs.ErrorListOnlyRoot)
+		return
+	}
+	if f.projectNumber == "" {
+		out.SetError(errors.New("can't list buckets without project number"))
+		return
+	}
+	listBuckets := f.svc.Buckets.List(f.projectNumber).MaxResults(listChunks)
+	for {
+		buckets, err := listBuckets.Do()
+		if err != nil {
+			out.SetError(err)
+			return
+		}
+		for _, bucket := range buckets.Items {
+			dir := &fs.Dir{
+				Name:  bucket.Name,
+				Bytes: 0,
+				Count: 0,
+			}
+			if out.AddDir(dir) {
 				return
 			}
-			listBuckets := f.svc.Buckets.List(f.projectNumber).MaxResults(listChunks)
-			for {
-				buckets, err := listBuckets.Do()
-				if err != nil {
-					fs.Stats.Error()
-					fs.ErrorLog(f, "Couldn't list buckets: %v", err)
-					break
-				} else {
-					for _, bucket := range buckets.Items {
-						out <- &fs.Dir{
-							Name:  bucket.Name,
-							Bytes: 0,
-							Count: 0,
-						}
-					}
-				}
-				if buckets.NextPageToken == "" {
-					break
-				}
-				listBuckets.PageToken(buckets.NextPageToken)
-			}
-		}()
-	} else {
-		// List the directories in the path in the bucket
-		go func() {
-			defer close(out)
-			f.list(true, func(remote string, object *storage.Object) {
-				out <- &fs.Dir{
-					Name:  remote,
-					Bytes: int64(object.Size),
-					Count: 0,
-				}
-			})
-		}()
+		}
+		if buckets.NextPageToken == "" {
+			break
+		}
+		listBuckets.PageToken(buckets.NextPageToken)
 	}
-	return out
+}
+
+// List lists the path to out
+func (f *Fs) List(out fs.ListOpts, dir string) {
+	if f.bucket == "" {
+		f.listBuckets(out, dir)
+	} else {
+		f.listFiles(out, dir)
+	}
+	return
 }
 
 // Put the object into the bucket
@@ -379,13 +437,13 @@ func (f *Fs) ListDir() fs.DirChan {
 // Copy the reader in to the new object which is returned
 //
 // The new object may have been created if an error is returned
-func (f *Fs) Put(in io.Reader, remote string, modTime time.Time, size int64) (fs.Object, error) {
+func (f *Fs) Put(in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
 	// Temporary Object under construction
 	o := &Object{
 		fs:     f,
-		remote: remote,
+		remote: src.Remote(),
 	}
-	return o, o.Update(in, modTime, size)
+	return o, o.Update(in, src)
 }
 
 // Mkdir creates the bucket if it doesn't exist
@@ -397,7 +455,7 @@ func (f *Fs) Mkdir() error {
 	}
 
 	if f.projectNumber == "" {
-		return fmt.Errorf("Can't make bucket without project number")
+		return errors.New("can't make bucket without project number")
 	}
 
 	bucket := storage.Bucket{
@@ -466,7 +524,7 @@ func (f *Fs) Hashes() fs.HashSet {
 // ------------------------------------------------------------
 
 // Fs returns the parent Fs
-func (o *Object) Fs() fs.Fs {
+func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
@@ -538,7 +596,11 @@ func (o *Object) readMetaData() (err error) {
 	}
 	object, err := o.fs.svc.Objects.Get(o.fs.bucket, o.fs.root+o.remote).Do()
 	if err != nil {
-		fs.Debug(o, "Failed to read info: %s", err)
+		if gErr, ok := err.(*googleapi.Error); ok {
+			if gErr.Code == http.StatusNotFound {
+				return fs.ErrorObjectNotFound
+			}
+		}
 		return err
 	}
 	o.setMetaData(object)
@@ -552,7 +614,7 @@ func (o *Object) readMetaData() (err error) {
 func (o *Object) ModTime() time.Time {
 	err := o.readMetaData()
 	if err != nil {
-		// fs.Log(o, "Failed to read metadata: %s", err)
+		// fs.Log(o, "Failed to read metadata: %v", err)
 		return time.Now()
 	}
 	return o.modTime
@@ -566,7 +628,7 @@ func metadataFromModTime(modTime time.Time) map[string]string {
 }
 
 // SetModTime sets the modification time of the local fs object
-func (o *Object) SetModTime(modTime time.Time) {
+func (o *Object) SetModTime(modTime time.Time) error {
 	// This only adds metadata so will perserve other metadata
 	object := storage.Object{
 		Bucket:   o.fs.bucket,
@@ -575,10 +637,10 @@ func (o *Object) SetModTime(modTime time.Time) {
 	}
 	newObject, err := o.fs.svc.Objects.Patch(o.fs.bucket, o.fs.root+o.remote, &object).Do()
 	if err != nil {
-		fs.Stats.Error()
-		fs.ErrorLog(o, "Failed to update remote mtime: %s", err)
+		return err
 	}
 	o.setMetaData(newObject)
+	return nil
 }
 
 // Storable returns a boolean as to whether this object is storable
@@ -609,7 +671,7 @@ func (o *Object) Open() (in io.ReadCloser, err error) {
 	}
 	if res.StatusCode != 200 {
 		_ = res.Body.Close() // ignore error
-		return nil, fmt.Errorf("Bad response: %d: %s", res.StatusCode, res.Status)
+		return nil, errors.Errorf("bad response: %d: %s", res.StatusCode, res.Status)
 	}
 	return res.Body, nil
 }
@@ -617,7 +679,10 @@ func (o *Object) Open() (in io.ReadCloser, err error) {
 // Update the object with the contents of the io.Reader, modTime and size
 //
 // The new object may have been created if an error is returned
-func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
+func (o *Object) Update(in io.Reader, src fs.ObjectInfo) error {
+	size := src.Size()
+	modTime := src.ModTime()
+
 	object := storage.Object{
 		Bucket:      o.fs.bucket,
 		Name:        o.fs.root + o.remote,
@@ -626,7 +691,7 @@ func (o *Object) Update(in io.Reader, modTime time.Time, size int64) error {
 		Updated:     modTime.Format(timeFormatOut), // Doesn't get set
 		Metadata:    metadataFromModTime(modTime),
 	}
-	newObject, err := o.fs.svc.Objects.Insert(o.fs.bucket, &object).Media(in).Name(object.Name).PredefinedAcl(o.fs.objectAcl).Do()
+	newObject, err := o.fs.svc.Objects.Insert(o.fs.bucket, &object).Media(in, googleapi.ContentType("")).Name(object.Name).PredefinedAcl(o.fs.objectAcl).Do()
 	if err != nil {
 		return err
 	}

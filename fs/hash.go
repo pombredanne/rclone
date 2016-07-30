@@ -8,6 +8,8 @@ import (
 	"hash"
 	"io"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 // HashType indicates a standard hashing algorithm
@@ -15,7 +17,7 @@ type HashType int
 
 // ErrHashUnsupported should be returned by filesystem,
 // if it is requested to deliver an unsupported hash type.
-var ErrHashUnsupported = fmt.Errorf("hash type not supported")
+var ErrHashUnsupported = errors.New("hash type not supported")
 
 const (
 	// HashMD5 indicates MD5 support
@@ -82,7 +84,7 @@ func (h HashType) String() string {
 // and this function must support all types.
 func hashFromTypes(set HashSet) (map[HashType]hash.Hash, error) {
 	if !set.SubsetOf(SupportedHashes) {
-		return nil, fmt.Errorf("Requested set %08x contains unknown hash types", int(set))
+		return nil, errors.Errorf("requested set %08x contains unknown hash types", int(set))
 	}
 	var hashers = make(map[HashType]hash.Hash)
 	types := set.Array()
@@ -115,8 +117,9 @@ func hashToMultiWriter(h map[HashType]hash.Hash) io.Writer {
 // A MultiHasher will construct various hashes on
 // all incoming writes.
 type MultiHasher struct {
-	io.Writer
-	h map[HashType]hash.Hash // Hashes
+	w    io.Writer
+	size int64
+	h    map[HashType]hash.Hash // Hashes
 }
 
 // NewMultiHasher will return a hash writer that will write all
@@ -136,8 +139,14 @@ func NewMultiHasherTypes(set HashSet) (*MultiHasher, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := MultiHasher{h: hashers, Writer: hashToMultiWriter(hashers)}
+	m := MultiHasher{h: hashers, w: hashToMultiWriter(hashers)}
 	return &m, nil
+}
+
+func (m *MultiHasher) Write(p []byte) (n int, err error) {
+	n, err = m.w.Write(p)
+	m.size += int64(n)
+	return n, err
 }
 
 // Sums returns the sums of all accumulated hashes as hex encoded
@@ -148,6 +157,11 @@ func (m *MultiHasher) Sums() map[HashType]string {
 		dst[k] = hex.EncodeToString(v.Sum(nil))
 	}
 	return dst
+}
+
+// Size returns the number of bytes written
+func (m *MultiHasher) Size() int64 {
+	return m.size
 }
 
 // A HashSet Indicates one or more hash types.

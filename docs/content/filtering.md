@@ -1,7 +1,7 @@
 ---
 title: "Filtering"
 description: "Filtering, includes and excludes"
-date: "2015-09-27"
+date: "2016-02-09"
 ---
 
 # Filtering, includes and excludes #
@@ -14,13 +14,14 @@ The filters are applied for the `copy`, `sync`, `move`, `ls`, `lsl`,
 Note that `purge` does not obey the filters.
 
 Each path as it passes through rclone is matched against the include
-and exclude rules.  The paths are matched without a leading `/`.
+and exclude rules like `--include`, `--exclude`, `--include-from`,
+`--exclude-from`, `--filter`, or `--filter-from`. The simplest way to
+try them out is using the `ls` command, or `--dry-run` together with
+`-v`.
 
-For example the files might be passed to the matching engine like this
-
-  * `file1.jpg`
-  * `file2.jpg`
-  * `directory/file3.jpg`
+**Important** Due to limitations of the command line parser you can
+only use any of these options once - if you duplicate them then rclone
+will use the last one only.
 
 ## Patterns ##
 
@@ -28,17 +29,20 @@ The patterns used to match files for inclusion or exclusion are based
 on "file globs" as used by the unix shell.
 
 If the pattern starts with a `/` then it only matches at the top level
-of the directory tree.  If it doesn't start with `/` then it is
-matched starting at the end of the path, but it will only match a
-complete path element.
+of the directory tree, relative to the root of the remote.
+If it doesn't start with `/` then it is matched starting at the
+**end of the path**, but it will only match a complete path element:
 
     file.jpg  - matches "file.jpg"
               - matches "directory/file.jpg"
               - doesn't match "afile.jpg"
               - doesn't match "directory/afile.jpg"
-    /file.jpg - matches "file.jpg"
+    /file.jpg - matches "file.jpg" in the root directory of the remote
               - doesn't match "afile.jpg"
               - doesn't match "directory/file.jpg"
+
+**Important** Note that you must use `/` in patterns and not `\` even
+if running on Windows.
 
 A `*` matches anything but not a `/`.
 
@@ -81,12 +85,36 @@ Special characters can be escaped with a `\` before them.
     \*.jpg       - matches "*.jpg"
     \\.jpg       - matches "\.jpg"
     \[one\].jpg  - matches "[one].jpg"
-  
+
+Note also that rclone filter globs can only be used in one of the
+filter command line flags, not in the specification of the remote, so
+`rclone copy "remote:dir*.jpg" /path/to/dir` won't work - what is
+required is `rclone --include "*.jpg" copy remote:dir /path/to/dir`
+
+### Directories ###
+
+Rclone keeps track of directories that could match any file patterns.
+
+Eg if you add the include rule
+
+    \a\*.jpg
+
+Rclone will synthesize the directory include rule
+
+    \a\
+
+If you put any rules which end in `\` then it will only match
+directories.
+
+Directory matches are **only** used to optimise directory access
+patterns - you must still match the files that you want to match.
+Directory matches won't optimise anything on bucket based remotes (eg
+s3, swift, google compute storage, b2) which don't have a concept of
+directory.
+
 ### Differences between rsync and rclone patterns ###
 
 Rclone implements bash style `{a,b,c}` glob matching which rsync doesn't.
-
-Rclone ignores `/` at the end of a pattern.
 
 Rclone always does a wildcard match so `\` must always escape a `\`.
 
@@ -119,6 +147,11 @@ This would exclude
 
   * `secret17.jpg`
   * non `*.jpg` and `*.png`
+
+A similar process is done on directory entries before recursing into
+them.  This only works on remotes which have a concept of directory
+(Eg local, google drive, onedrive, amazon drive) and not on bucket
+based remotes (eg s3, swift, google compute storage, b2).
 
 ## Adding filtering rules ##
 
@@ -223,6 +256,41 @@ Prepare a file like this `files-from.txt`
 
 Then use as `--files-from files-from.txt`.  This will only transfer
 `file1.jpg` and `file2.jpg` providing they exist.
+
+For example, let's say you had a few files you want to back up
+regularly with these absolute paths:
+
+    /home/user1/important
+    /home/user1/dir/file
+    /home/user2/stuff
+
+To copy these you'd find a common subdirectory - in this case `/home`
+and put the remaining files in `files-from.txt` with or without
+leading `/`, eg
+
+    user1/important
+    user1/dir/file
+    user2/stuff
+
+You could then copy these to a remote like this
+
+    rclone copy --files-from files-from.txt /home remote:backup
+
+The 3 files will arrive in `remote:backup` with the paths as in the
+`files-from.txt`.
+
+You could of course choose `/` as the root too in which case your
+`files-from.txt` might look like this.
+
+    /home/user1/important
+    /home/user1/dir/file
+    /home/user2/stuff
+
+And you would transfer it like this
+
+    rclone copy --files-from files-from.txt / remote:backup
+
+In this case there will be an extra `home` directory on the remote.
 
 ### `--min-size` - Don't transfer any file smaller than this ###
 

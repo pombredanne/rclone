@@ -15,6 +15,7 @@ type Pacer struct {
 	minSleep           time.Duration // minimum sleep time
 	maxSleep           time.Duration // maximum sleep time
 	decayConstant      uint          // decay constant
+	attackConstant     uint          // attack constant
 	pacer              chan struct{} // To pace the operations
 	sleepTime          time.Duration // Time to sleep for each transaction
 	retries            int           // Max number of retries
@@ -38,7 +39,7 @@ const (
 	// above that set with SetMaxSleep.
 	DefaultPacer = Type(iota)
 
-	// AmazonCloudDrivePacer is a specialised pacer for Amazon Cloud Drive
+	// AmazonCloudDrivePacer is a specialised pacer for Amazon Drive
 	//
 	// It implements a truncated exponential backoff strategy with
 	// randomization.  Normally operations are paced at the
@@ -58,11 +59,12 @@ type Paced func() (bool, error)
 // New returns a Pacer with sensible defaults
 func New() *Pacer {
 	p := &Pacer{
-		minSleep:      10 * time.Millisecond,
-		maxSleep:      2 * time.Second,
-		decayConstant: 2,
-		retries:       10,
-		pacer:         make(chan struct{}, 1),
+		minSleep:       10 * time.Millisecond,
+		maxSleep:       2 * time.Second,
+		decayConstant:  2,
+		attackConstant: 1,
+		retries:        fs.Config.LowLevelRetries,
+		pacer:          make(chan struct{}, 1),
 	}
 	p.sleepTime = p.minSleep
 	p.SetPacer(DefaultPacer)
@@ -72,6 +74,21 @@ func New() *Pacer {
 	p.pacer <- struct{}{}
 
 	return p
+}
+
+// SetSleep sets the current sleep time
+func (p *Pacer) SetSleep(t time.Duration) *Pacer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sleepTime = t
+	return p
+}
+
+// GetSleep gets the current sleep time
+func (p *Pacer) GetSleep() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sleepTime
 }
 
 // SetMinSleep sets the minimum sleep time for the pacer
@@ -116,11 +133,24 @@ func (p *Pacer) SetMaxConnections(n int) *Pacer {
 // This is the speed the time falls back to the minimum after errors
 // have occurred.
 //
-// bigger for slower decay, exponential
+// bigger for slower decay, exponential. 1 is halve, 0 is go straight to minimum
 func (p *Pacer) SetDecayConstant(decay uint) *Pacer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.decayConstant = decay
+	return p
+}
+
+// SetAttackConstant sets the attack constant for the pacer
+//
+// This is the speed the time grows from the minimum after errors have
+// occurred.
+//
+// bigger for slower attack, 1 is double, 0 is go straight to maximum
+func (p *Pacer) SetAttackConstant(attack uint) *Pacer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.attackConstant = attack
 	return p
 }
 
@@ -185,7 +215,11 @@ func (p *Pacer) beginCall() {
 func (p *Pacer) defaultPacer(retry bool) {
 	oldSleepTime := p.sleepTime
 	if retry {
-		p.sleepTime *= 2
+		if p.attackConstant == 0 {
+			p.sleepTime = p.maxSleep
+		} else {
+			p.sleepTime = (p.sleepTime << p.attackConstant) / ((1 << p.attackConstant) - 1)
+		}
 		if p.sleepTime > p.maxSleep {
 			p.sleepTime = p.maxSleep
 		}
@@ -204,7 +238,7 @@ func (p *Pacer) defaultPacer(retry bool) {
 }
 
 // acdPacer implements a truncated exponential backoff
-// strategy with randomization for Amazon Cloud Drive
+// strategy with randomization for Amazon Drive
 //
 // See the description for AmazonCloudDrivePacer
 //
@@ -231,7 +265,7 @@ func (p *Pacer) acdPacer(retry bool) {
 		if p.sleepTime < p.minSleep {
 			p.sleepTime = p.minSleep
 		}
-		fs.Debug("pacer", "Rate limited, sleeping for %v (%d retries)", p.sleepTime, consecutiveRetries)
+		fs.Debug("pacer", "Rate limited, sleeping for %v (%d consecutive low level retries)", p.sleepTime, consecutiveRetries)
 	}
 }
 
@@ -256,13 +290,14 @@ func (p *Pacer) endCall(retry bool) {
 // call implements Call but with settable retries
 func (p *Pacer) call(fn Paced, retries int) (err error) {
 	var retry bool
-	for i := 0; i < retries; i++ {
+	for i := 1; i <= retries; i++ {
 		p.beginCall()
 		retry, err = fn()
 		p.endCall(retry)
 		if !retry {
 			break
 		}
+		fs.Debug("pacer", "low level retry %d/%d (error %v)", i, retries, err)
 	}
 	if retry {
 		err = fs.RetryError(err)

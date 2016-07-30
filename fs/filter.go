@@ -6,11 +6,13 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -27,15 +29,15 @@ var (
 	filesFrom      = pflag.StringP("files-from", "", "", "Read list of source-file names from file")
 	minAge         = pflag.StringP("min-age", "", "", "Don't transfer any file younger than this in s or suffix ms|s|m|h|d|w|M|y")
 	maxAge         = pflag.StringP("max-age", "", "", "Don't transfer any file older than this in s or suffix ms|s|m|h|d|w|M|y")
-	minSize        SizeSuffix
-	maxSize        SizeSuffix
+	minSize        = SizeSuffix(-1)
+	maxSize        = SizeSuffix(-1)
 	dumpFilters    = pflag.BoolP("dump-filters", "", false, "Dump the filters to the output")
 	//cvsExclude     = pflag.BoolP("cvs-exclude", "C", false, "Exclude files in the same way CVS does")
 )
 
 func init() {
-	pflag.VarP(&minSize, "min-size", "", "Don't transfer any file smaller than this in k or suffix k|M|G")
-	pflag.VarP(&maxSize, "max-size", "", "Don't transfer any file larger than this in k or suffix k|M|G")
+	pflag.VarP(&minSize, "min-size", "", "Don't transfer any file smaller than this in k or suffix b|k|M|G")
+	pflag.VarP(&maxSize, "max-size", "", "Don't transfer any file larger than this in k or suffix b|k|M|G")
 }
 
 // rule is one filter rule
@@ -58,6 +60,40 @@ func (r *rule) String() string {
 	return fmt.Sprintf("%s %s", c, r.Regexp.String())
 }
 
+// rules is a slice of rules
+type rules struct {
+	rules    []rule
+	existing map[string]struct{}
+}
+
+// add adds a rule if it doesn't exist already
+func (rs *rules) add(Include bool, re *regexp.Regexp) {
+	if rs.existing == nil {
+		rs.existing = make(map[string]struct{})
+	}
+	newRule := rule{
+		Include: Include,
+		Regexp:  re,
+	}
+	newRuleString := newRule.String()
+	if _, ok := rs.existing[newRuleString]; ok {
+		return // rule already exists
+	}
+	rs.rules = append(rs.rules, newRule)
+	rs.existing[newRuleString] = struct{}{}
+}
+
+// clear clears all the rules
+func (rs *rules) clear() {
+	rs.rules = nil
+	rs.existing = nil
+}
+
+// len returns the number of rules
+func (rs *rules) len() int {
+	return len(rs.rules)
+}
+
 // filesMap describes the map of files to transfer
 type filesMap map[string]struct{}
 
@@ -68,8 +104,10 @@ type Filter struct {
 	MaxSize        int64
 	ModTimeFrom    time.Time
 	ModTimeTo      time.Time
-	rules          []rule
-	files          filesMap
+	fileRules      rules
+	dirRules       rules
+	files          filesMap // files if filesFrom
+	dirs           filesMap // dirs from filesFrom
 }
 
 // We use time conventions
@@ -170,7 +208,7 @@ func NewFilter() (f *Filter, err error) {
 		}
 	}
 	if addImplicitExclude {
-		err = f.Add(false, "*")
+		err = f.Add(false, "/**")
 		if err != nil {
 			return nil, err
 		}
@@ -190,7 +228,7 @@ func NewFilter() (f *Filter, err error) {
 		}
 		f.ModTimeFrom = time.Now().Add(-duration)
 		if !f.ModTimeTo.IsZero() && f.ModTimeTo.Before(f.ModTimeFrom) {
-			return nil, fmt.Errorf("Argument --min-age can't be larger than --max-age")
+			return nil, errors.New("argument --min-age can't be larger than --max-age")
 		}
 		Debug(nil, "--max-age %v to %v", duration, f.ModTimeFrom)
 	}
@@ -202,17 +240,49 @@ func NewFilter() (f *Filter, err error) {
 	return f, nil
 }
 
+// addDirGlobs adds directory globs from the file glob passed in
+func (f *Filter) addDirGlobs(Include bool, glob string) error {
+	for _, dirGlob := range globToDirGlobs(glob) {
+		// Don't add "/" as we always include the root
+		if dirGlob == "/" {
+			continue
+		}
+		dirRe, err := globToRegexp(dirGlob)
+		if err != nil {
+			return err
+		}
+		f.dirRules.add(Include, dirRe)
+	}
+	return nil
+}
+
 // Add adds a filter rule with include or exclude status indicated
 func (f *Filter) Add(Include bool, glob string) error {
+	isDirRule := strings.HasSuffix(glob, "/")
+	isFileRule := !isDirRule
+	if strings.HasSuffix(glob, "**") {
+		isDirRule, isFileRule = true, true
+	}
 	re, err := globToRegexp(glob)
 	if err != nil {
 		return err
 	}
-	rule := rule{
-		Include: Include,
-		Regexp:  re,
+	if isFileRule {
+		f.fileRules.add(Include, re)
+		// If include rule work out what directories are needed to scan
+		// if exclude rule, we can't rule anything out
+		// Unless it is `*` which matches everything
+		// NB ** and /** are DirRules
+		if Include || glob == "*" {
+			err = f.addDirGlobs(Include, glob)
+			if err != nil {
+				return err
+			}
+		}
 	}
-	f.rules = append(f.rules, rule)
+	if isDirRule {
+		f.dirRules.add(Include, re)
+	}
 	return nil
 }
 
@@ -237,22 +307,74 @@ func (f *Filter) AddRule(rule string) error {
 	case strings.HasPrefix(rule, "+ "):
 		return f.Add(true, rule[2:])
 	}
-	return fmt.Errorf("Malformed rule %q", rule)
+	return errors.Errorf("malformed rule %q", rule)
 }
 
 // AddFile adds a single file to the files from list
 func (f *Filter) AddFile(file string) error {
 	if f.files == nil {
 		f.files = make(filesMap)
+		f.dirs = make(filesMap)
 	}
 	file = strings.Trim(file, "/")
 	f.files[file] = struct{}{}
+	// Put all the parent directories into f.dirs
+	for {
+		file = path.Dir(file)
+		if file == "." {
+			break
+		}
+		if _, found := f.dirs[file]; found {
+			break
+		}
+		f.dirs[file] = struct{}{}
+	}
 	return nil
 }
 
 // Clear clears all the filter rules
 func (f *Filter) Clear() {
-	f.rules = nil
+	f.fileRules.clear()
+	f.dirRules.clear()
+}
+
+// InActive returns false if any filters are active
+func (f *Filter) InActive() bool {
+	return (f.files == nil &&
+		f.ModTimeFrom.IsZero() &&
+		f.ModTimeTo.IsZero() &&
+		f.MinSize < 0 &&
+		f.MaxSize < 0 &&
+		f.fileRules.len() == 0 &&
+		f.dirRules.len() == 0)
+}
+
+// includeRemote returns whether this remote passes the filter rules.
+func (f *Filter) includeRemote(remote string) bool {
+	for _, rule := range f.fileRules.rules {
+		if rule.Match(remote) {
+			return rule.Include
+		}
+	}
+	return true
+}
+
+// IncludeDirectory returns whether this directory should be included
+// in the sync or not.
+func (f *Filter) IncludeDirectory(remote string) bool {
+	remote = strings.Trim(remote, "/")
+	// filesFrom takes precedence
+	if f.files != nil {
+		_, include := f.dirs[remote]
+		return include
+	}
+	remote += "/"
+	for _, rule := range f.dirRules.rules {
+		if rule.Match(remote) {
+			return rule.Include
+		}
+	}
+	return true
 }
 
 // Include returns whether this object should be included into the
@@ -269,18 +391,13 @@ func (f *Filter) Include(remote string, size int64, modTime time.Time) bool {
 	if !f.ModTimeTo.IsZero() && modTime.After(f.ModTimeTo) {
 		return false
 	}
-	if f.MinSize != 0 && size < f.MinSize {
+	if f.MinSize >= 0 && size < f.MinSize {
 		return false
 	}
-	if f.MaxSize != 0 && size > f.MaxSize {
+	if f.MaxSize >= 0 && size > f.MaxSize {
 		return false
 	}
-	for _, rule := range f.rules {
-		if rule.Match(remote) {
-			return rule.Include
-		}
-	}
-	return true
+	return f.includeRemote(remote)
 }
 
 // IncludeObject returns whether this object should be included into
@@ -331,8 +448,13 @@ func (f *Filter) DumpFilters() string {
 	if !f.ModTimeTo.IsZero() {
 		rules = append(rules, fmt.Sprintf("Last-modified date must be equal or less than: %s", f.ModTimeTo.String()))
 	}
-	for _, rule := range f.rules {
+	rules = append(rules, "--- File filter rules ---")
+	for _, rule := range f.fileRules.rules {
 		rules = append(rules, rule.String())
+	}
+	rules = append(rules, "--- Directory filter rules ---")
+	for _, dirRule := range f.dirRules.rules {
+		rules = append(rules, dirRule.String())
 	}
 	return strings.Join(rules, "\n")
 }
