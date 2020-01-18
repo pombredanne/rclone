@@ -19,19 +19,16 @@ and exclude rules like `--include`, `--exclude`, `--include-from`,
 try them out is using the `ls` command, or `--dry-run` together with
 `-v`.
 
-**Important** Due to limitations of the command line parser you can
-only use any of these options once - if you duplicate them then rclone
-will use the last one only.
-
 ## Patterns ##
 
 The patterns used to match files for inclusion or exclusion are based
 on "file globs" as used by the unix shell.
 
 If the pattern starts with a `/` then it only matches at the top level
-of the directory tree, relative to the root of the remote.
-If it doesn't start with `/` then it is matched starting at the
-**end of the path**, but it will only match a complete path element:
+of the directory tree, **relative to the root of the remote** (not
+necessarily the root of the local drive). If it doesn't start with `/`
+then it is matched starting at the **end of the path**, but it will
+only match a complete path element:
 
     file.jpg  - matches "file.jpg"
               - matches "directory/file.jpg"
@@ -63,7 +60,7 @@ A `?` matches any character except a slash `/`.
           - matches "lass"
           - doesn't match "floss"
 
-A `[` and `]` together make a a character class, such as `[a-z]` or
+A `[` and `]` together make a character class, such as `[a-z]` or
 `[aeiou]` or `[[:alpha:]]`.  See the [go regexp
 docs](https://golang.org/pkg/regexp/syntax/) for more info on these.
 
@@ -72,7 +69,7 @@ docs](https://golang.org/pkg/regexp/syntax/) for more info on these.
              - doesn't match "hullo"
 
 A `{` and `}` define a choice between elements.  It should contain a
-comma seperated list of patterns, any of which might match.  These
+comma separated list of patterns, any of which might match.  These
 patterns can contain wildcards.
 
     {one,two}_potato - matches "one_potato"
@@ -86,6 +83,18 @@ Special characters can be escaped with a `\` before them.
     \\.jpg       - matches "\.jpg"
     \[one\].jpg  - matches "[one].jpg"
 
+Patterns are case sensitive unless the `--ignore-case` flag is used.
+
+Without `--ignore-case` (default)
+
+    potato - matches "potato"
+           - doesn't match "POTATO"
+
+With `--ignore-case`
+
+    potato - matches "potato"
+           - matches "POTATO"
+
 Note also that rclone filter globs can only be used in one of the
 filter command line flags, not in the specification of the remote, so
 `rclone copy "remote:dir*.jpg" /path/to/dir` won't work - what is
@@ -97,13 +106,13 @@ Rclone keeps track of directories that could match any file patterns.
 
 Eg if you add the include rule
 
-    \a\*.jpg
+    /a/*.jpg
 
 Rclone will synthesize the directory include rule
 
-    \a\
+    /a/
 
-If you put any rules which end in `\` then it will only match
+If you put any rules which end in `/` then it will only match
 directories.
 
 Directory matches are **only** used to optimise directory access
@@ -120,13 +129,14 @@ Rclone always does a wildcard match so `\` must always escape a `\`.
 
 ## How the rules are used ##
 
-Rclone maintains a list of include rules and exclude rules.
+Rclone maintains a combined list of include rules and exclude rules.
 
-Each file is matched in order against the list until it finds a match.
-The file is then included or excluded according to the rule type.
+Each file is matched in order, starting from the top, against the rule
+in the list until it finds a match.  The file is then included or
+excluded according to the rule type.
 
-If the matcher falls off the bottom of the list then the path is
-included.
+If the matcher fails to find a match after testing against all the
+entries in the list then the path is included.
 
 For example given the following rules, `+` being include, `-` being
 exclude,
@@ -157,15 +167,46 @@ based remotes (eg s3, swift, google compute storage, b2).
 
 Filtering rules are added with the following command line flags.
 
+### Repeating options ##
+
+You can repeat the following options to add more than one rule of that
+type.
+
+  * `--include`
+  * `--include-from`
+  * `--exclude`
+  * `--exclude-from`
+  * `--filter`
+  * `--filter-from`
+
+**Important** You should not use `--include*` together with `--exclude*`. 
+It may produce different results than you expected. In that case try to use: `--filter*`.
+
+Note that all the options of the same type are processed together in
+the order above, regardless of what order they were placed on the
+command line.
+
+So all `--include` options are processed first in the order they
+appeared on the command line, then all `--include-from` options etc.
+
+To mix up the order includes and excludes, the `--filter` flag can be
+used.
+
 ### `--exclude` - Exclude files matching pattern ###
 
 Add a single exclude rule with `--exclude`.
+
+This flag can be repeated.  See above for the order the flags are
+processed in.
 
 Eg `--exclude *.bak` to exclude all bak files from the sync.
 
 ### `--exclude-from` - Read exclude patterns from file ###
 
 Add exclude rules from a file.
+
+This flag can be repeated.  See above for the order the flags are
+processed in.
 
 Prepare a file like this `exclude-file.txt`
 
@@ -182,6 +223,9 @@ This is useful if you have a lot of rules.
 
 Add a single include rule with `--include`.
 
+This flag can be repeated.  See above for the order the flags are
+processed in.
+
 Eg `--include *.{png,jpg}` to include all `png` and `jpg` files in the
 backup and no others.
 
@@ -194,6 +238,9 @@ flexibility then you must use `--filter-from`.
 ### `--include-from` - Read include patterns from file ###
 
 Add include rules from a file.
+
+This flag can be repeated.  See above for the order the flags are
+processed in.
 
 Prepare a file like this `include-file.txt`
 
@@ -219,19 +266,27 @@ This can be used to add a single include or exclude rule.  Include
 rules start with `+ ` and exclude rules start with `- `.  A special
 rule called `!` can be used to clear the existing rules.
 
+This flag can be repeated.  See above for the order the flags are
+processed in.
+
 Eg `--filter "- *.bak"` to exclude all bak files from the sync.
 
 ### `--filter-from` - Read filtering patterns from a file ###
 
 Add include/exclude rules from a file.
 
+This flag can be repeated.  See above for the order the flags are
+processed in.
+
 Prepare a file like this `filter-file.txt`
 
-    # a sample exclude rule file
+    # a sample filter rule file
     - secret*.jpg
     + *.jpg
     + *.png
     + file2.avi
+    - /dir/Trash/**
+    + /dir/**
     # exclude everything else
     - *
 
@@ -239,26 +294,50 @@ Then use as `--filter-from filter-file.txt`.  The rules are processed
 in the order that they are defined.
 
 This example will include all `jpg` and `png` files, exclude any files
-matching `secret*.jpg` and include `file2.avi`.  Everything else will
-be excluded from the sync.
+matching `secret*.jpg` and include `file2.avi`.  It will also include
+everything in the directory `dir` at the root of the sync, except
+`dir/Trash` which it will exclude.  Everything else will be excluded
+from the sync.
 
 ### `--files-from` - Read list of source-file names ###
 
 This reads a list of file names from the file passed in and **only**
-these files are transferred.  The filtering rules are ignored
+these files are transferred.  The **filtering rules are ignored**
 completely if you use this option.
 
-Prepare a file like this `files-from.txt`
+Rclone will traverse the file system if you use `--files-from`,
+effectively using the files in `--files-from` as a set of filters.
+Rclone will not error if any of the files are missing.
+
+If you use `--no-traverse` as well as `--files-from` then rclone will
+not traverse the destination file system, it will find each file
+individually using approximately 1 API call. This can be more
+efficient for small lists of files.
+
+This option can be repeated to read from more than one file.  These
+are read in the order that they are placed on the command line.
+
+Paths within the `--files-from` file will be interpreted as starting
+with the root specified in the command.  Leading `/` characters are
+ignored.
+
+For example, suppose you had `files-from.txt` with this content:
 
     # comment
     file1.jpg
-    file2.jpg
+    subdir/file2.jpg
 
-Then use as `--files-from files-from.txt`.  This will only transfer
-`file1.jpg` and `file2.jpg` providing they exist.
+You could then use it like this:
 
-For example, let's say you had a few files you want to back up
-regularly with these absolute paths:
+    rclone copy --files-from files-from.txt /home/me/pics remote:pics
+
+This will transfer these files only (if they exist)
+
+    /home/me/pics/file1.jpg        → remote:pics/file1.jpg
+    /home/me/pics/subdir/file2.jpg → remote:pics/subdir/file2.jpg
+
+To take a more complicated example, let's say you had a few files you
+want to back up regularly with these absolute paths:
 
     /home/user1/important
     /home/user1/dir/file
@@ -277,7 +356,11 @@ You could then copy these to a remote like this
     rclone copy --files-from files-from.txt /home remote:backup
 
 The 3 files will arrive in `remote:backup` with the paths as in the
-`files-from.txt`.
+`files-from.txt` like this:
+
+    /home/user1/important → remote:backup/user1/important
+    /home/user1/dir/file  → remote:backup/user1/dir/file
+    /home/user2/stuff     → remote:backup/user2/stuff
 
 You could of course choose `/` as the root too in which case your
 `files-from.txt` might look like this.
@@ -290,7 +373,11 @@ And you would transfer it like this
 
     rclone copy --files-from files-from.txt / remote:backup
 
-In this case there will be an extra `home` directory on the remote.
+In this case there will be an extra `home` directory on the remote:
+
+    /home/user1/important → remote:backup/home/user1/important
+    /home/user1/dir/file  → remote:backup/home/user1/dir/file
+    /home/user2/stuff     → remote:backup/home/user2/stuff
 
 ### `--min-size` - Don't transfer any file smaller than this ###
 
@@ -355,11 +442,20 @@ these are now excluded from the sync.
 
 Always test first with `--dry-run` and `-v` before using this flag.
 
-### `--dump-filters` - dump the filters to the output ###
+### `--dump filters` - dump the filters to the output ###
 
 This dumps the defined filters to the output as regular expressions.
 
 Useful for debugging.
+
+### `--ignore-case` - make searches case insensitive ###
+
+Normally filter patterns are case sensitive.  If this flag is supplied
+then filter patterns become case insensitive.
+
+Normally a `--include "file.txt"` will not match a file called
+`FILE.txt`.  However if you use the `--ignore-case` flag then
+`--include "file.txt"` this will match a file called `FILE.txt`.
 
 ## Quoting shell metacharacters ##
 
@@ -376,3 +472,24 @@ In Windows the expansion is done by the command not the shell so this
 should work fine
 
   * `--include *.jpg`
+
+## Exclude directory based on a file ##
+
+It is possible to exclude a directory based on a file, which is
+present in this directory. Filename should be specified using the
+`--exclude-if-present` flag. This flag has a priority over the other
+filtering flags.
+
+Imagine, you have the following directory structure:
+
+    dir1/file1
+    dir1/dir2/file2
+    dir1/dir2/dir3/file3
+    dir1/dir2/dir3/.ignore
+
+You can exclude `dir3` from sync by running the following command:
+
+    rclone sync --exclude-if-present .ignore dir1 remote:backup
+
+Currently only one filename is supported, i.e. `--exclude-if-present`
+should not be used multiple times.

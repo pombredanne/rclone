@@ -1,10 +1,10 @@
 ---
 title: "Google Cloud Storage"
 description: "Rclone docs for Google Cloud Storage"
-date: "2015-09-12"
+date: "2017-07-18"
 ---
 
-<i class="fa fa-google"></i> Google Cloud Storage
+<i class="fab fa-google"></i> Google Cloud Storage
 -------------------------------------------------
 
 Paths are specified as `remote:bucket` (or `remote:` for the `lsd`
@@ -28,66 +28,93 @@ e/n/d/q> n
 name> remote
 Type of storage to configure.
 Choose a number from below, or type in your own value
- 1 / Amazon Drive
-   \ "amazon cloud drive"
- 2 / Amazon S3 (also Dreamhost, Ceph)
-   \ "s3"
- 3 / Backblaze B2
-   \ "b2"
- 4 / Dropbox
-   \ "dropbox"
- 5 / Google Cloud Storage (this is not Google Drive)
+[snip]
+XX / Google Cloud Storage (this is not Google Drive)
    \ "google cloud storage"
- 6 / Google Drive
-   \ "drive"
- 7 / Hubic
-   \ "hubic"
- 8 / Local Disk
-   \ "local"
- 9 / Microsoft OneDrive
-   \ "onedrive"
-10 / Openstack Swift (Rackspace Cloud Files, Memset Memstore, OVH)
-   \ "swift"
-11 / Yandex Disk
-   \ "yandex"
-Storage> 5
+[snip]
+Storage> google cloud storage
 Google Application Client Id - leave blank normally.
-client_id> 
+client_id>
 Google Application Client Secret - leave blank normally.
-client_secret> 
+client_secret>
 Project number optional - needed only for list/create/delete buckets - see your developer console.
 project_number> 12345678
 Service Account Credentials JSON file path - needed only if you want use SA instead of interactive login.
-service_account_file> 
+service_account_file>
 Access Control List for new objects.
 Choose a number from below, or type in your own value
- * Object owner gets OWNER access, and all Authenticated Users get READER access.
- 1) authenticatedRead
- * Object owner gets OWNER access, and project team owners get OWNER access.
- 2) bucketOwnerFullControl
- * Object owner gets OWNER access, and project team owners get READER access.
- 3) bucketOwnerRead
- * Object owner gets OWNER access [default if left blank].
- 4) private
- * Object owner gets OWNER access, and project team members get access according to their roles.
- 5) projectPrivate
- * Object owner gets OWNER access, and all Users get READER access.
- 6) publicRead
+ 1 / Object owner gets OWNER access, and all Authenticated Users get READER access.
+   \ "authenticatedRead"
+ 2 / Object owner gets OWNER access, and project team owners get OWNER access.
+   \ "bucketOwnerFullControl"
+ 3 / Object owner gets OWNER access, and project team owners get READER access.
+   \ "bucketOwnerRead"
+ 4 / Object owner gets OWNER access [default if left blank].
+   \ "private"
+ 5 / Object owner gets OWNER access, and project team members get access according to their roles.
+   \ "projectPrivate"
+ 6 / Object owner gets OWNER access, and all Users get READER access.
+   \ "publicRead"
 object_acl> 4
 Access Control List for new buckets.
 Choose a number from below, or type in your own value
- * Project team owners get OWNER access, and all Authenticated Users get READER access.
- 1) authenticatedRead
- * Project team owners get OWNER access [default if left blank].
- 2) private
- * Project team members get access according to their roles.
- 3) projectPrivate
- * Project team owners get OWNER access, and all Users get READER access.
- 4) publicRead
- * Project team owners get OWNER access, and all Users get WRITER access.
- 5) publicReadWrite
+ 1 / Project team owners get OWNER access, and all Authenticated Users get READER access.
+   \ "authenticatedRead"
+ 2 / Project team owners get OWNER access [default if left blank].
+   \ "private"
+ 3 / Project team members get access according to their roles.
+   \ "projectPrivate"
+ 4 / Project team owners get OWNER access, and all Users get READER access.
+   \ "publicRead"
+ 5 / Project team owners get OWNER access, and all Users get WRITER access.
+   \ "publicReadWrite"
 bucket_acl> 2
-Remote config
+Location for the newly created buckets.
+Choose a number from below, or type in your own value
+ 1 / Empty for default location (US).
+   \ ""
+ 2 / Multi-regional location for Asia.
+   \ "asia"
+ 3 / Multi-regional location for Europe.
+   \ "eu"
+ 4 / Multi-regional location for United States.
+   \ "us"
+ 5 / Taiwan.
+   \ "asia-east1"
+ 6 / Tokyo.
+   \ "asia-northeast1"
+ 7 / Singapore.
+   \ "asia-southeast1"
+ 8 / Sydney.
+   \ "australia-southeast1"
+ 9 / Belgium.
+   \ "europe-west1"
+10 / London.
+   \ "europe-west2"
+11 / Iowa.
+   \ "us-central1"
+12 / South Carolina.
+   \ "us-east1"
+13 / Northern Virginia.
+   \ "us-east4"
+14 / Oregon.
+   \ "us-west1"
+location> 12
+The storage class to use when storing objects in Google Cloud Storage.
+Choose a number from below, or type in your own value
+ 1 / Default
+   \ ""
+ 2 / Multi-regional storage class
+   \ "MULTI_REGIONAL"
+ 3 / Regional storage class
+   \ "REGIONAL"
+ 4 / Nearline storage class
+   \ "NEARLINE"
+ 5 / Coldline storage class
+   \ "COLDLINE"
+ 6 / Durable reduced availability storage class
+   \ "DURABLE_REDUCED_AVAILABILITY"
+storage_class> 5
 Remote config
 Use auto config?
  * Say Y if not sure
@@ -102,8 +129,8 @@ Got code
 --------------------
 [remote]
 type = google cloud storage
-client_id = 
-client_secret = 
+client_id =
+client_secret =
 token = {"AccessToken":"xxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","RefreshToken":"x/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_xxxxxxxxx","Expiry":"2014-07-17T20:49:14.929208288+01:00","Extra":null}
 project_number = 12345678
 object_acl = private
@@ -163,10 +190,239 @@ are what rclone will use for authentication.
 To use a Service Account instead of OAuth2 token flow, enter the path
 to your Service Account credentials at the `service_account_file`
 prompt and rclone won't use the browser based authentication
-flow.
+flow. If you'd rather stuff the contents of the credentials file into
+the rclone config file, you can set `service_account_credentials` with
+the actual contents of the file instead, or set the equivalent
+environment variable.
+
+### Application Default Credentials ###
+
+If no other source of credentials is provided, rclone will fall back
+to
+[Application Default Credentials](https://cloud.google.com/video-intelligence/docs/common/auth#authenticating_with_application_default_credentials)
+this is useful both when you already have configured authentication
+for your developer account, or in production when running on a google
+compute host. Note that if running in docker, you may need to run
+additional commands on your google compute machine -
+[see this page](https://cloud.google.com/container-registry/docs/advanced-authentication#gcloud_as_a_docker_credential_helper).
+
+Note that in the case application default credentials are used, there
+is no need to explicitly configure a project number.
+
+### --fast-list ###
+
+This remote supports `--fast-list` which allows you to use fewer
+transactions in exchange for more memory. See the [rclone
+docs](/docs/#fast-list) for more details.
 
 ### Modified time ###
 
 Google google cloud storage stores md5sums natively and rclone stores
 modification times as metadata on the object, under the "mtime" key in
 RFC3339 format accurate to 1ns.
+
+#### Restricted filename characters
+
+| Character | Value | Replacement |
+| --------- |:-----:|:-----------:|
+| NUL       | 0x00  | ␀           |
+| LF        | 0x0A  | ␊           |
+| CR        | 0x0D  | ␍           |
+| /         | 0x2F  | ／          |
+
+Invalid UTF-8 bytes will also be [replaced](/overview/#invalid-utf8),
+as they can't be used in JSON strings.
+
+<!--- autogenerated options start - DO NOT EDIT, instead edit fs.RegInfo in backend/googlecloudstorage/googlecloudstorage.go then run make backenddocs -->
+### Standard Options
+
+Here are the standard options specific to google cloud storage (Google Cloud Storage (this is not Google Drive)).
+
+#### --gcs-client-id
+
+Google Application Client Id
+Leave blank normally.
+
+- Config:      client_id
+- Env Var:     RCLONE_GCS_CLIENT_ID
+- Type:        string
+- Default:     ""
+
+#### --gcs-client-secret
+
+Google Application Client Secret
+Leave blank normally.
+
+- Config:      client_secret
+- Env Var:     RCLONE_GCS_CLIENT_SECRET
+- Type:        string
+- Default:     ""
+
+#### --gcs-project-number
+
+Project number.
+Optional - needed only for list/create/delete buckets - see your developer console.
+
+- Config:      project_number
+- Env Var:     RCLONE_GCS_PROJECT_NUMBER
+- Type:        string
+- Default:     ""
+
+#### --gcs-service-account-file
+
+Service Account Credentials JSON file path
+Leave blank normally.
+Needed only if you want use SA instead of interactive login.
+
+- Config:      service_account_file
+- Env Var:     RCLONE_GCS_SERVICE_ACCOUNT_FILE
+- Type:        string
+- Default:     ""
+
+#### --gcs-service-account-credentials
+
+Service Account Credentials JSON blob
+Leave blank normally.
+Needed only if you want use SA instead of interactive login.
+
+- Config:      service_account_credentials
+- Env Var:     RCLONE_GCS_SERVICE_ACCOUNT_CREDENTIALS
+- Type:        string
+- Default:     ""
+
+#### --gcs-object-acl
+
+Access Control List for new objects.
+
+- Config:      object_acl
+- Env Var:     RCLONE_GCS_OBJECT_ACL
+- Type:        string
+- Default:     ""
+- Examples:
+    - "authenticatedRead"
+        - Object owner gets OWNER access, and all Authenticated Users get READER access.
+    - "bucketOwnerFullControl"
+        - Object owner gets OWNER access, and project team owners get OWNER access.
+    - "bucketOwnerRead"
+        - Object owner gets OWNER access, and project team owners get READER access.
+    - "private"
+        - Object owner gets OWNER access [default if left blank].
+    - "projectPrivate"
+        - Object owner gets OWNER access, and project team members get access according to their roles.
+    - "publicRead"
+        - Object owner gets OWNER access, and all Users get READER access.
+
+#### --gcs-bucket-acl
+
+Access Control List for new buckets.
+
+- Config:      bucket_acl
+- Env Var:     RCLONE_GCS_BUCKET_ACL
+- Type:        string
+- Default:     ""
+- Examples:
+    - "authenticatedRead"
+        - Project team owners get OWNER access, and all Authenticated Users get READER access.
+    - "private"
+        - Project team owners get OWNER access [default if left blank].
+    - "projectPrivate"
+        - Project team members get access according to their roles.
+    - "publicRead"
+        - Project team owners get OWNER access, and all Users get READER access.
+    - "publicReadWrite"
+        - Project team owners get OWNER access, and all Users get WRITER access.
+
+#### --gcs-bucket-policy-only
+
+Access checks should use bucket-level IAM policies.
+
+If you want to upload objects to a bucket with Bucket Policy Only set
+then you will need to set this.
+
+When it is set, rclone:
+
+- ignores ACLs set on buckets
+- ignores ACLs set on objects
+- creates buckets with Bucket Policy Only set
+
+Docs: https://cloud.google.com/storage/docs/bucket-policy-only
+
+
+- Config:      bucket_policy_only
+- Env Var:     RCLONE_GCS_BUCKET_POLICY_ONLY
+- Type:        bool
+- Default:     false
+
+#### --gcs-location
+
+Location for the newly created buckets.
+
+- Config:      location
+- Env Var:     RCLONE_GCS_LOCATION
+- Type:        string
+- Default:     ""
+- Examples:
+    - ""
+        - Empty for default location (US).
+    - "asia"
+        - Multi-regional location for Asia.
+    - "eu"
+        - Multi-regional location for Europe.
+    - "us"
+        - Multi-regional location for United States.
+    - "asia-east1"
+        - Taiwan.
+    - "asia-east2"
+        - Hong Kong.
+    - "asia-northeast1"
+        - Tokyo.
+    - "asia-south1"
+        - Mumbai.
+    - "asia-southeast1"
+        - Singapore.
+    - "australia-southeast1"
+        - Sydney.
+    - "europe-north1"
+        - Finland.
+    - "europe-west1"
+        - Belgium.
+    - "europe-west2"
+        - London.
+    - "europe-west3"
+        - Frankfurt.
+    - "europe-west4"
+        - Netherlands.
+    - "us-central1"
+        - Iowa.
+    - "us-east1"
+        - South Carolina.
+    - "us-east4"
+        - Northern Virginia.
+    - "us-west1"
+        - Oregon.
+    - "us-west2"
+        - California.
+
+#### --gcs-storage-class
+
+The storage class to use when storing objects in Google Cloud Storage.
+
+- Config:      storage_class
+- Env Var:     RCLONE_GCS_STORAGE_CLASS
+- Type:        string
+- Default:     ""
+- Examples:
+    - ""
+        - Default
+    - "MULTI_REGIONAL"
+        - Multi-regional storage class
+    - "REGIONAL"
+        - Regional storage class
+    - "NEARLINE"
+        - Nearline storage class
+    - "COLDLINE"
+        - Coldline storage class
+    - "DURABLE_REDUCED_AVAILABILITY"
+        - Durable reduced availability storage class
+
+<!--- autogenerated options stop -->
